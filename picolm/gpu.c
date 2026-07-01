@@ -77,6 +77,7 @@ static struct {
     /* Weights */
     gpu_weight_t                  weights[MAX_GPU_WEIGHTS];
     int                           n_weights;
+    int                           gpu_layers;  /* how many layers on GPU (0 = all) */
 
     int                           initialized;
 } gs;
@@ -139,9 +140,19 @@ static VkShaderModule gpu_load_shader(const unsigned char *spv, size_t size) {
 int gpu_init(const model_t *m) {
     memset(&gs, 0, sizeof(gs));
 
-    /* Estimate total weight size for VRAM check */
+    /* Layer offloading: default = all layers. Set PICOLM_GPU_LAYERS=N to limit. */
+    gs.gpu_layers = m->config.n_layers;
+    const char *layers_env = getenv("PICOLM_GPU_LAYERS");
+    if (layers_env) {
+        int n = atoi(layers_env);
+        if (n > 0 && n <= m->config.n_layers)
+            gs.gpu_layers = n;
+    }
+
+    /* Estimate total weight size for VRAM check (only gpu_layers layers) */
     size_t total_weights = 0;
-    for (int l = 0; l < m->config.n_layers; l++) {
+    int layers_to_upload = gs.gpu_layers;
+    for (int l = 0; l < layers_to_upload && l < m->config.n_layers; l++) {
         const layer_weights_t *lw = &m->weights.layers[l];
         #define ADD_WEIGHT(ptr, qtype, dim_out, dim_in) do { \
             if (ptr && (qtype) != GGUF_TYPE_F32) { \
@@ -157,12 +168,14 @@ int gpu_init(const model_t *m) {
         ADD_WEIGHT(lw->ffn_down,    lw->type_ffn_down,    m->config.n_embd, m->config.n_ffn);
         #undef ADD_WEIGHT
     }
-    if (m->weights.output && m->weights.type_output != GGUF_TYPE_F32)
+    if (gs.gpu_layers > 0 &&
+        m->weights.output && m->weights.type_output != GGUF_TYPE_F32)
         total_weights += gguf_type_row_size(m->weights.type_output, m->config.n_embd)
                          * (size_t)m->config.vocab_size;
 
-    fprintf(stderr, "GPU: ~%.1f MB model weights to upload\n",
-            (double)total_weights / (1024.0 * 1024.0));
+    fprintf(stderr, "GPU: ~%.1f MB model weights to upload (%d/%d layers)\n",
+            (double)total_weights / (1024.0 * 1024.0),
+            gs.gpu_layers, m->config.n_layers);
 
     /* ---- Instance ---- */
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -332,8 +345,9 @@ int gpu_init(const model_t *m) {
     gs.staging_w_cap = 0;
 
     free(phys);
+
     gs.initialized = 1;
-    fprintf(stderr, "GPU: Vulkan init OK\n");
+    fprintf(stderr, "GPU: Vulkan init OK (%d/%d layers)\n", gs.gpu_layers, m->config.n_layers);
     return 0;
 }
 
@@ -430,7 +444,7 @@ int gpu_upload_model(const model_t *m) {
         } \
     } while(0)
 
-    for (int l = 0; l < m->config.n_layers; l++) {
+    for (int l = 0; l < gs.gpu_layers && l < m->config.n_layers; l++) {
         const layer_weights_t *lw = &m->weights.layers[l];
         UPLOAD(lw->attn_q,      lw->type_attn_q,      m->config.n_embd, m->config.n_embd);
         UPLOAD(lw->attn_k,      lw->type_attn_k,      m->config.n_kv_heads * m->config.head_dim, m->config.n_embd);
@@ -440,7 +454,8 @@ int gpu_upload_model(const model_t *m) {
         UPLOAD(lw->ffn_up,      lw->type_ffn_up,      m->config.n_ffn, m->config.n_embd);
         UPLOAD(lw->ffn_down,    lw->type_ffn_down,    m->config.n_embd, m->config.n_ffn);
     }
-    UPLOAD(m->weights.output, m->weights.type_output, m->config.vocab_size, m->config.n_embd);
+    if (gs.gpu_layers > 0)
+        UPLOAD(m->weights.output, m->weights.type_output, m->config.vocab_size, m->config.n_embd);
 
     #undef UPLOAD
 
