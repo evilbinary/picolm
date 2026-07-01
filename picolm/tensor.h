@@ -18,6 +18,12 @@ int  tensor_get_threads(void);
  * Uses fused dequant+dot (no scratch buffer) and optional threading. */
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype);
 
+/* Matrix-vector multiply with bias: out[d] = W[d, n] @ x[n] + b[d]
+ * If b is NULL, bias is skipped. */
+void matmul_bias(float *out, const float *x, const void *W, const void *b,
+                 int n, int d, gguf_type_t w_type, gguf_type_t b_type,
+                 float *scratch);
+
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
 void rmsnorm(float *out, const float *x, const float *weight, int size);
 

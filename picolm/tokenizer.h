@@ -11,6 +11,7 @@ typedef struct {
     int    *sorted_idx;  /* indices sorted by vocab string for binary search */
     uint32_t bos_id;
     uint32_t eos_id;
+    int     is_sentencepiece; /* 1=SentencePiece (LLaMA), 0=GPT-2/tiktoken (Qwen2) */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.

@@ -23,6 +23,7 @@ typedef struct {
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
+    float rms_norm_eps;   /* RMSNorm epsilon (LLaMA: 1e-5, Qwen2: 1e-7) */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
 } model_config_t;
@@ -39,6 +40,11 @@ typedef struct {
     const void *ffn_gate;
     const void *ffn_down;
     const void *ffn_up;
+    /* Bias pointers (Qwen2, etc. have these; LLaMA doesn't) */
+    const void *attn_q_b;
+    const void *attn_k_b;
+    const void *attn_v_b;
+    const void *attn_output_b;
     /* Per-tensor quantization types */
     gguf_type_t type_attn_norm;
     gguf_type_t type_attn_q;
@@ -49,6 +55,11 @@ typedef struct {
     gguf_type_t type_ffn_gate;
     gguf_type_t type_ffn_down;
     gguf_type_t type_ffn_up;
+    /* Bias quantization types */
+    gguf_type_t type_attn_q_b;
+    gguf_type_t type_attn_k_b;
+    gguf_type_t type_attn_v_b;
+    gguf_type_t type_attn_output_b;
 } layer_weights_t;
 
 typedef struct {
@@ -73,7 +84,7 @@ typedef struct {
     float *hb2;          /* FFN hidden buffer 2 [n_ffn] */
     float *logits;       /* output logits [vocab_size] */
 
-    /* KV cache stored as FP16 to halve memory (22 MB -> 11 MB for TinyLlama) */
+    /* KV cache stored as FP16 to halve memory */
     uint16_t *key_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
     uint16_t *val_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
 
@@ -88,6 +99,12 @@ typedef struct {
     float *attn_norm_w[MAX_LAYERS];
     float *ffn_norm_w[MAX_LAYERS];
     float *output_norm_w;
+
+    /* Pre-dequantized bias buffers (Qwen2, etc.) */
+    float *attn_q_bias[MAX_LAYERS];
+    float *attn_k_bias[MAX_LAYERS];
+    float *attn_v_bias[MAX_LAYERS];
+    float *attn_output_bias[MAX_LAYERS];
 
     /* Single allocation base */
     void *mem_block;
@@ -122,6 +139,7 @@ typedef struct {
     uint64_t    tok_n_scores;
     uint32_t    tok_bos_id;
     uint32_t    tok_eos_id;
+    int         tok_add_bos;   /* 1=prepend BOS token on encode (default for LLaMA) */
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
@@ -135,12 +153,7 @@ void model_free(model_t *m);
 
 /* ---- KV cache persistence ---- */
 
-/* Save KV cache state for positions [0, n_pos) to a file.
- * Returns 0 on success. */
 int kvcache_save(const model_t *m, const char *path, int n_pos);
-
-/* Load KV cache state from a file. Returns the number of positions
- * loaded (0 on failure). Caller should start generation from this position. */
 int kvcache_load(model_t *m, const char *path);
 
 #endif /* MODEL_H */

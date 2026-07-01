@@ -612,6 +612,19 @@ make native
 # Second run should say "Skipping N cached prompt tokens"
 ```
 
+### run
+
+```
+./picolm.exe ../qwen2.5-1.5b-instruct-q4_k_m.gguf -n 200 -j 4 -c 256 -t 0 <<'EOF'
+<|im_start|>user
+你好，请介绍一下你自己
+<|im_end|>
+<|im_start|>assistant
+EOF
+
+
+```
+
 ### Memory verification
 
 PicoLM prints memory stats to stderr:

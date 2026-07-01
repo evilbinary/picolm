@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
     /* Encode prompt */
     int max_prompt_tokens = (int)strlen(prompt) + 3;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
-    int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+    int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
 
     /* If cache covers part of the prompt, skip those positions */
     int start_pos = 0;

@@ -122,6 +122,16 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     }
 }
 
+void matmul_bias(float *out, const float *x, const void *W, const void *b,
+                 int n, int d, gguf_type_t w_type, gguf_type_t b_type,
+                 float *scratch) {
+    matmul(out, x, W, n, d, w_type);
+    if (b) {
+        dequantize_row(b, scratch, d, b_type);
+        vec_add(out, scratch, d);
+    }
+}
+
 /* ================================================================
  * SIMD-accelerated basic operations
  * ================================================================ */
