@@ -221,11 +221,25 @@ int gpu_init(const model_t *m) {
     }
 
     gs.phys_dev = phys[chosen];
-
     VkPhysicalDeviceProperties dev_props;
     vkGetPhysicalDeviceProperties(gs.phys_dev, &dev_props);
     vkGetPhysicalDeviceMemoryProperties(gs.phys_dev, &gs.mem_props);
-    fprintf(stderr, "GPU: %s\n", dev_props.deviceName);
+
+    /* Skip integrated GPUs by default — they're slower than CPU for this workload.
+     * Set PICOLM_GPU_FORCE=1 to override. */
+    if (dev_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        const char *force = getenv("PICOLM_GPU_FORCE");
+        if (!force || force[0] != '1') {
+            fprintf(stderr, "GPU: %s (integrated), skipping — set PICOLM_GPU_FORCE=1 to use it\n",
+                    dev_props.deviceName);
+            free(phys);
+            vkDestroyInstance(gs.instance, NULL);
+            return -1;
+        }
+        fprintf(stderr, "GPU: %s (integrated, forced)\n", dev_props.deviceName);
+    } else {
+        fprintf(stderr, "GPU: %s\n", dev_props.deviceName);
+    }
 
     /* VRAM check */
     VkDeviceSize vram_total = 0;
@@ -584,6 +598,9 @@ int gpu_try_matmul(float *out, const float *x, const void *W,
     vkWaitForFences(gs.device, 1, &gs.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(gs.device, 1, &gs.fence);
 
+    fprintf(stderr, "GPU: matmul n=%d d=%d qtype=%d row_bytes=%zu groups=%d\n",
+            n, d, (int)qtype, gw->row_bytes, (d + 255) / 256);
+
     /* Update descriptor set */
     VkDescriptorBufferInfo x_info   = { gs.staging_x_buf, 0, (size_t)n * sizeof(float) };
     VkDescriptorBufferInfo W_info   = { gw->buffer, 0, gw->total_bytes };
@@ -658,8 +675,12 @@ int gpu_try_matmul(float *out, const float *x, const void *W,
     si.pCommandBuffers = &gs.cmd_buf;
     VK_CHECK(vkQueueSubmit(gs.queue, 1, &si, gs.fence));
 
-    /* Wait and read back */
-    vkWaitForFences(gs.device, 1, &gs.fence, VK_TRUE, UINT64_MAX);
+    /* Wait with 5s timeout */
+    VkResult fr = vkWaitForFences(gs.device, 1, &gs.fence, VK_TRUE, 5000000000ULL);
+    if (fr != VK_SUCCESS) {
+        fprintf(stderr, "GPU: fence wait failed (result=%d), falling back to CPU\n", (int)fr);
+        return -1;
+    }
     memcpy(out, gs.staging_out_ptr, (size_t)d * sizeof(float));
 
     return 0;
