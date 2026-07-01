@@ -223,6 +223,8 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 
     cfg->alignment = 32;
     cfg->rope_freq_base = 10000.0f;
+    cfg->rms_norm_eps = 1e-5f;  /* LLaMA default, Qwen2 uses 1e-7 */
+    cfg->rope_type = ROPE_TYPE_LLAMA;  /* LLaMA default, Qwen2 uses interleaved */
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
     m->tok_bos_id = 1;
@@ -258,8 +260,25 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rms_norm_eps = read_f32(&r);
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "general.architecture")) {
+            /* Detect model architecture for RoPE type selection */
+            if (vtype == GGUF_META_STRING) {
+                gguf_str_t arch = read_gguf_string(&r);
+                if (str_eq(arch, "qwen2") || str_eq(arch, "qwen3")) {
+                    cfg->rope_type = ROPE_TYPE_QWEN;
+                }
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "llama.vocab_size")
             || str_eq(key, "qwen2.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
@@ -424,7 +443,9 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             cfg->n_embd, cfg->n_ffn, cfg->n_heads, cfg->n_kv_heads);
     fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
             cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
-    fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_freq_base);
+    fprintf(stderr, "  head_dim=%d, rope_base=%.1f, rope_type=%s\n",
+            cfg->head_dim, cfg->rope_freq_base,
+            cfg->rope_type == ROPE_TYPE_QWEN ? "qwen" : "llama");
 
     free(tinfos);
     return 0;
@@ -639,7 +660,7 @@ float *model_forward(model_t *m, int token, int pos) {
         layer_weights_t *lw = &w->layers[l];
 
         /* ---- Attention ---- */
-        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim);
+        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* QKV projections (with optional bias for Qwen2, etc.) */
         int q_dim = n_heads * head_dim;
@@ -657,7 +678,7 @@ float *model_forward(model_t *m, int token, int pos) {
         uint16_t *key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
 
         /* Apply RoPE to Q and K (using pre-computed tables) */
-        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
 
         /* Convert K to FP16 and store */
         for (int d = 0; d < kv_dim; d++) {
@@ -745,7 +766,7 @@ float *model_forward(model_t *m, int token, int pos) {
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (SwiGLU) ---- */
-        rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim);
+        rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim, c->rms_norm_eps);
 
         matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
         matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
@@ -758,7 +779,7 @@ float *model_forward(model_t *m, int token, int pos) {
     }
 
     /* 3. Final RMSNorm */
-    rmsnorm(s->x, s->x, s->output_norm_w, dim);
+    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
 
     /* 4. Output projection -> logits */
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);

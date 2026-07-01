@@ -622,6 +622,29 @@ make native
 <|im_start|>assistant
 EOF
 
+./picolm.exe ../qwen2.5-1.5b-instruct-q4_k_m.gguf -n 200 -j 4 -c 256 -t 0 <<'EOF'
+<|im_start|>user
+hello
+<|im_end|>
+<|im_start|>assistant
+EOF
+
+./picolm.exe ../qwen2.5-coder-1.5b-instruct-q4_k_m.gguf -n 200 -j 4 -c 256 -t 0 <<'EOF'
+<|im_start|>user
+hello
+<|im_end|>
+<|im_start|>assistant
+EOF
+
+
+./picolm.exe ../qwen2.5-coder-1.5b-instruct-q4_k_m.gguf -n 200 -j 4 -c 256 -t 0 <<'EOF'
+<|im_start|>user
+hello
+<|im_end|>
+<|im_start|>assistant
+EOF
+
+
 
 ```
 

@@ -11,6 +11,12 @@
 /* Magic for KV cache files */
 #define KVCACHE_MAGIC 0x4B564350  /* "KVCP" */
 
+/* ---- RoPE type: LLaMA uses pairwise, Qwen2 uses interleaved ---- */
+typedef enum {
+    ROPE_TYPE_LLAMA = 0,  /* pairwise: q[i*2] and q[i*2+1] */
+    ROPE_TYPE_QWEN  = 1,  /* interleaved: q[i] and q[i+half] */
+} rope_type_t;
+
 /* ---- Configuration ---- */
 
 typedef struct {
@@ -24,6 +30,7 @@ typedef struct {
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
     float rms_norm_eps;   /* RMSNorm epsilon (LLaMA: 1e-5, Qwen2: 1e-7) */
+    rope_type_t rope_type; /* RoPE implementation type */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
 } model_config_t;

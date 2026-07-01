@@ -25,7 +25,7 @@ void matmul_bias(float *out, const float *x, const void *W, const void *b,
                  float *scratch);
 
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
-void rmsnorm(float *out, const float *x, const float *weight, int size);
+void rmsnorm(float *out, const float *x, const float *weight, int size, float eps);
 
 /* In-place softmax over x[0..size-1] */
 void softmax(float *x, int size);
@@ -34,9 +34,10 @@ void softmax(float *x, int size);
  * cos_pos and sin_pos point to the tables for the current position:
  *   cos_pos[i] = cos(pos / freq_base^(2i/head_dim))
  *   sin_pos[i] = sin(pos / freq_base^(2i/head_dim))
- * Each has head_dim/2 entries. */
+ * Each has head_dim/2 entries.
+ * type: ROPE_TYPE_LLAMA (pairwise) or ROPE_TYPE_QWEN (interleaved) */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
-          const float *cos_pos, const float *sin_pos);
+          const float *cos_pos, const float *sin_pos, int type);
 
 /* In-place SiLU: x[i] = x[i] / (1 + exp(-x[i])) */
 void silu(float *x, int size);
