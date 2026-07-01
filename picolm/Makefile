@@ -7,9 +7,13 @@ TARGET  = picolm
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
 
-# --- Native build (auto-detect CPU, enables SSE2/AVX on x86) ---
+# --- Native build (auto-detect CPU, enables SSE2/AVX/AVX2 on x86) ---
 native: CFLAGS += -march=native
 native: $(TARGET)
+
+# --- x86-64 with AVX2 + FMA (explicit, for CPUs that support it) ---
+native-avx2: CFLAGS += -O3 -mavx2 -mfma -mpopcnt
+native-avx2: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -70,4 +74,4 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe *.obj *.o
 
-.PHONY: native static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+.PHONY: native native-avx2 static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean

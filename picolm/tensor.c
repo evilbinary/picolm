@@ -1,4 +1,5 @@
 #include "tensor.h"
+#include "quant.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -128,7 +129,16 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 void rmsnorm(float *out, const float *x, const float *weight, int size) {
     float ss = 0.0f;
 
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+    }
+    ss = hsum_avx2(acc);
+    for (; i < size; i++) ss += x[i] * x[i];
+#elif defined(PICOLM_NEON)
     float32x4_t acc = vdupq_n_f32(0);
     int i = 0;
     for (; i + 3 < size; i += 4) {
@@ -152,7 +162,16 @@ void rmsnorm(float *out, const float *x, const float *weight, int size) {
 
     ss = 1.0f / sqrtf(ss / (float)size + 1e-5f);
 
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    __m256 scale = _mm256_set1_ps(ss);
+    i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 w = _mm256_loadu_ps(weight + i);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(v, scale), w));
+    }
+    for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+#elif defined(PICOLM_NEON)
     float32x4_t scale = vdupq_n_f32(ss);
     i = 0;
     for (; i + 3 < size; i += 4) {
@@ -187,7 +206,14 @@ void softmax(float *x, int size) {
     }
     float inv = 1.0f / sum;
 
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    __m256 inv_v = _mm256_set1_ps(inv);
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), inv_v));
+    }
+    for (; i < size; i++) x[i] *= inv;
+#elif defined(PICOLM_NEON)
     float32x4_t inv_v = vdupq_n_f32(inv);
     int i = 0;
     for (; i + 3 < size; i += 4) {
@@ -262,7 +288,13 @@ void silu(float *x, int size) {
 }
 
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    }
+    for (; i < size; i++) out[i] = a[i] * b[i];
+#elif defined(PICOLM_NEON)
     int i = 0;
     for (; i + 3 < size; i += 4) {
         vst1q_f32(out + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
@@ -280,7 +312,13 @@ void elemwise_mul(float *out, const float *a, const float *b, int size) {
 }
 
 void vec_add(float *a, const float *b, int size) {
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        _mm256_storeu_ps(a + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    }
+    for (; i < size; i++) a[i] += b[i];
+#elif defined(PICOLM_NEON)
     int i = 0;
     for (; i + 3 < size; i += 4) {
         vst1q_f32(a + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));

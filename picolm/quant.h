@@ -30,6 +30,21 @@ static inline float hsum_sse(__m128 v) {
 }
 #endif
 
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#define PICOLM_AVX2 1
+#include <immintrin.h>
+static inline float hsum_avx2(__m256 v) {
+    __m128 low = _mm256_extractf128_ps(v, 0);
+    __m128 high = _mm256_extractf128_ps(v, 1);
+    low = _mm_add_ps(low, high);
+    __m128 shuf = _mm_movehl_ps(low, low);
+    __m128 sum = _mm_add_ps(low, shuf);
+    shuf = _mm_shuffle_ps(sum, sum, 1);
+    sum = _mm_add_ss(sum, shuf);
+    return _mm_cvtss_f32(sum);
+}
+#endif
+
 /* GGUF tensor data types */
 typedef enum {
     GGUF_TYPE_F32   = 0,

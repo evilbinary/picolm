@@ -340,7 +340,19 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
 float vec_dot_f32_f32(const void *src, const float *x, int n) {
     const float *w = (const float *)src;
 
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i),     _mm256_loadu_ps(x + i),     acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8), acc1);
+    }
+    float sum = hsum_avx2(_mm256_add_ps(acc0, acc1));
+    for (; i < n; i++) sum += w[i] * x[i];
+    return sum;
+
+#elif defined(PICOLM_NEON)
     float32x4_t acc0 = vdupq_n_f32(0);
     float32x4_t acc1 = vdupq_n_f32(0);
     int i = 0;
@@ -397,23 +409,61 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
             float d2 = d * (float)sc;
             float m2 = dmin * (float)mn;
 
-#ifdef PICOLM_NEON
+#if defined(PICOLM_AVX2)
+            __m256 sum_qx1_v = _mm256_setzero_ps();
+            __m256 sum_x1_v  = _mm256_setzero_ps();
+            __m256 sum_qx2_v = _mm256_setzero_ps();
+            __m256 sum_x2_v  = _mm256_setzero_ps();
+
+            for (int l = 0; l < 32; l += 8) {
+                /* Load 8 bytes of quantized data */
+                __m128i qbytes = _mm_loadl_epi64((const __m128i *)(q + l));
+
+                /* Expand 8-bit to 16-bit for easier nibble extraction */
+                __m128i q_16 = _mm_cvtepu8_epi16(qbytes);
+
+                /* Extract low nibbles: AND 0xF */
+                __m128i q_lo_16 = _mm_and_si128(q_16, _mm_set1_epi16(0xF));
+
+                /* Extract high nibbles: shift right 4 bits */
+                __m128i q_hi_16 = _mm_srli_epi16(q_16, 4);
+
+                /* Expand to 32-bit integers */
+                __m256i q_lo_32 = _mm256_cvtepu16_epi32(q_lo_16);
+                __m256i q_hi_32 = _mm256_cvtepu16_epi32(q_hi_16);
+
+                /* Convert to float */
+                __m256 qf_lo = _mm256_cvtepi32_ps(q_lo_32);
+                __m256 qf_hi = _mm256_cvtepi32_ps(q_hi_32);
+
+                /* Load input vectors and accumulate */
+                __m256 xv_lo = _mm256_loadu_ps(xp + l);
+                __m256 xv_hi = _mm256_loadu_ps(xp + l + 32);
+
+                sum_qx1_v = _mm256_fmadd_ps(qf_lo, xv_lo, sum_qx1_v);
+                sum_x1_v  = _mm256_add_ps(sum_x1_v, xv_lo);
+                sum_qx2_v = _mm256_fmadd_ps(qf_hi, xv_hi, sum_qx2_v);
+                sum_x2_v  = _mm256_add_ps(sum_x2_v, xv_hi);
+            }
+
+            float sum_qx1 = hsum_avx2(sum_qx1_v);
+            float sum_x1  = hsum_avx2(sum_x1_v);
+            float sum_qx2 = hsum_avx2(sum_qx2_v);
+            float sum_x2  = hsum_avx2(sum_x2_v);
+#elif defined(PICOLM_NEON)
             float32x4_t sum_qx1_v = vdupq_n_f32(0);
             float32x4_t sum_x1_v  = vdupq_n_f32(0);
             float32x4_t sum_qx2_v = vdupq_n_f32(0);
             float32x4_t sum_x2_v  = vdupq_n_f32(0);
 
             for (int l = 0; l < 32; l += 8) {
-                /* Load 8 quantized bytes, extract nibbles */
                 uint8x8_t qbytes = vld1_u8(q + l);
                 uint8x8_t q_lo_8 = vand_u8(qbytes, vdup_n_u8(0xF));
                 uint8x8_t q_hi_8 = vshr_n_u8(qbytes, 4);
 
-                /* Widen to 16-bit */
                 uint16x8_t q_lo_16 = vmovl_u8(q_lo_8);
                 uint16x8_t q_hi_16 = vmovl_u8(q_hi_8);
 
-                /* First 4 elements */
                 float32x4_t qf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q_lo_16)));
                 float32x4_t xv0 = vld1q_f32(xp + l);
                 sum_qx1_v = vmlaq_f32(sum_qx1_v, qf0, xv0);
@@ -424,7 +474,6 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
                 sum_qx2_v = vmlaq_f32(sum_qx2_v, qf0h, xv0h);
                 sum_x2_v  = vaddq_f32(sum_x2_v, xv0h);
 
-                /* Next 4 elements */
                 float32x4_t qf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(q_lo_16)));
                 float32x4_t xv1 = vld1q_f32(xp + l + 4);
                 sum_qx1_v = vmlaq_f32(sum_qx1_v, qf1, xv1);
