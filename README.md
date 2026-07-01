@@ -658,6 +658,14 @@ hello
 EOF
 
 
+./picolm.exe ../qwen2.5-7b-instruct-q4_k_m.gguf -n 200 -j 4 -c 256 -t 0 <<'EOF'
+<|im_start|>user
+你好，请用中文介绍一下你自己
+<|im_end|>
+<|im_start|>assistant
+EOF
+
+
 
 ```
 

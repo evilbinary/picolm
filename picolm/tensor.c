@@ -22,19 +22,9 @@ void tensor_init_scratch(float *buf, int size) {
     scratch_size = size;
 }
 
-/* ---- Threading for matmul ---- */
+/* ---- Thread pool for matmul (persistent threads, no per-call CreateThread) ---- */
 
 static int n_threads = 1;
-
-void tensor_set_threads(int t) {
-    if (t < 1) t = 1;
-    if (t > MAX_THREADS) t = MAX_THREADS;
-    n_threads = t;
-}
-
-int tensor_get_threads(void) {
-    return n_threads;
-}
 
 typedef struct {
     float       *out;
@@ -47,23 +37,135 @@ typedef struct {
     gguf_type_t  qtype;
 } matmul_task_t;
 
-static
+/* Thread pool state */
+static matmul_task_t pool_tasks[MAX_THREADS];
+static int            pool_nworkers;  /* number of worker threads created */
+
 #ifdef _WIN32
-DWORD WINAPI
+static HANDLE       pool_threads[MAX_THREADS];
+static HANDLE       pool_wake_events[MAX_THREADS];  /* auto-reset events, one per worker */
+static HANDLE       pool_done_event;                 /* manual-reset, signaled when all workers done */
+static volatile LONG pool_done_remaining;
+static volatile LONG pool_shutdown;
 #else
-void *
+static volatile int   pool_gen;
+static volatile int   pool_done;
+static volatile int   pool_shutdown;
+static pthread_t       pool_threads[MAX_THREADS];
+static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  pool_cond   = PTHREAD_COND_INITIALIZER;
 #endif
-matmul_worker(void *arg) {
-    matmul_task_t *t = (matmul_task_t *)arg;
+
+/* The actual work: vec_dot over a range of output rows */
+static void matmul_worker_task(matmul_task_t *t) {
     for (int i = t->start; i < t->end; i++) {
         t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
                             t->x, t->n, t->qtype);
     }
+}
+
 #ifdef _WIN32
+static DWORD WINAPI matmul_worker_loop(LPVOID arg) {
+    int tid = (int)(size_t)arg;
+    HANDLE ev = pool_wake_events[tid];
+    while (1) {
+        WaitForSingleObject(ev, INFINITE);
+        if (pool_shutdown) break;
+        matmul_worker_task(&pool_tasks[tid]);
+        if (InterlockedDecrement(&pool_done_remaining) == 0)
+            SetEvent(pool_done_event);
+    }
     return 0;
+}
 #else
+static void *matmul_worker_loop(void *arg) {
+    int tid = (int)(size_t)arg;
+    int last_gen = 0;
+    pthread_mutex_lock(&pool_mutex);
+    while (1) {
+        while (pool_gen == last_gen && !pool_shutdown) {
+            pthread_cond_wait(&pool_cond, &pool_mutex);
+        }
+        if (pool_shutdown) break;
+        last_gen = pool_gen;
+        pthread_mutex_unlock(&pool_mutex);
+        /* task data is visible because mutex unlock in matmul()
+         * synchronizes-with the pthread_cond_wait return */
+        matmul_worker_task(&pool_tasks[tid]);
+        pthread_mutex_lock(&pool_mutex);
+        pool_done++;
+        pthread_cond_signal(&pool_cond);
+    }
+    pthread_mutex_unlock(&pool_mutex);
     return NULL;
+}
 #endif
+
+/* (Re-)create thread pool. Called from tensor_set_threads and lazily from matmul. */
+static void matmul_pool_init(int nt) {
+    if (pool_nworkers > 0) return; /* already running */
+    if (nt <= 1) return;
+#ifdef _WIN32
+    pool_done_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    pool_shutdown = 0;
+    pool_nworkers = nt - 1;
+    for (int i = 1; i < nt; i++) {
+        pool_wake_events[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
+        pool_threads[i] = CreateThread(NULL, 0, matmul_worker_loop,
+                                       (LPVOID)(size_t)i, 0, NULL);
+    }
+#else
+    pool_gen = 0;
+    pool_done = 0;
+    pool_shutdown = 0;
+    pool_nworkers = nt - 1;
+    for (int i = 1; i < nt; i++) {
+        pthread_create(&pool_threads[i], NULL, matmul_worker_loop,
+                       (void *)(size_t)i);
+    }
+#endif
+}
+
+/* Idempotent — safe to call from matmul when pool is already running */
+static void matmul_pool_wake(int nt) {
+#ifdef _WIN32
+    pool_done_remaining = nt - 1;
+    ResetEvent(pool_done_event);
+    MemoryBarrier();
+    for (int i = 1; i < nt; i++)
+        SetEvent(pool_wake_events[i]);
+#else
+    pthread_mutex_lock(&pool_mutex);
+    pool_gen++;
+    pthread_cond_broadcast(&pool_cond);
+    pthread_mutex_unlock(&pool_mutex);
+#endif
+}
+
+static void matmul_pool_wait(int nt) {
+#ifdef _WIN32
+    WaitForSingleObject(pool_done_event, INFINITE);
+#else
+    pthread_mutex_lock(&pool_mutex);
+    while (pool_done < nt - 1) {
+        pthread_cond_wait(&pool_cond, &pool_mutex);
+    }
+    pool_done = 0;
+    pthread_mutex_unlock(&pool_mutex);
+#endif
+}
+
+/* ---- Public API ---- */
+
+void tensor_set_threads(int t) {
+    if (t < 1) t = 1;
+    if (t > MAX_THREADS) t = MAX_THREADS;
+    n_threads = t;
+    /* pool will be lazily initialised on first matmul call */
+}
+
+int tensor_get_threads(void) {
+    return n_threads;
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
@@ -80,47 +182,37 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     int nt = n_threads;
     if (nt > d) nt = d;
 
-    matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-    HANDLE threads[MAX_THREADS];
-#else
-    pthread_t threads[MAX_THREADS];
-#endif
+    /* Ensure pool is running (lazy init on first multi-threaded call) */
+    if (pool_nworkers <= 0) {
+        matmul_pool_init(nt);
+    }
 
+    /* Divide work across threads */
     int rows_per = d / nt;
     int extra = d % nt;
     int row = 0;
 
     for (int t = 0; t < nt; t++) {
-        tasks[t].out = out;
-        tasks[t].x = x;
-        tasks[t].W = wptr;
-        tasks[t].row_bytes = row_bytes;
-        tasks[t].n = n;
-        tasks[t].qtype = qtype;
-        tasks[t].start = row;
+        matmul_task_t *task = &pool_tasks[t];
+        task->out       = out;
+        task->x         = x;
+        task->W         = wptr;
+        task->row_bytes = row_bytes;
+        task->n         = n;
+        task->qtype     = qtype;
+        task->start     = row;
         row += rows_per + (t < extra ? 1 : 0);
-        tasks[t].end = row;
+        task->end       = row;
     }
 
-    for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-        threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
-#else
-        pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-    }
+    /* Wake workers (threads 1..nt-1) */
+    matmul_pool_wake(nt);
 
-    matmul_worker(&tasks[0]);
+    /* Main thread works too (thread 0) */
+    matmul_worker_task(&pool_tasks[0]);
 
-    for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-        WaitForSingleObject(threads[t], INFINITE);
-        CloseHandle(threads[t]);
-#else
-        pthread_join(threads[t], NULL);
-#endif
-    }
+    /* Wait for all workers to finish */
+    matmul_pool_wait(nt);
 }
 
 void matmul_bias(float *out, const float *x, const void *W, const void *b,
