@@ -15,6 +15,13 @@ native: $(TARGET)
 native-avx2: CFLAGS += -O3 -mavx2 -mfma -mpopcnt
 native-avx2: $(TARGET)
 
+# --- Barrier pool mode (fused FFN gate+up, -DUSE_BARRIER_POOL) ---
+barrier: CFLAGS += -march=native -DUSE_BARRIER_POOL
+barrier: $(TARGET)
+
+barrier-avx2: CFLAGS += -O3 -mavx2 -mfma -mpopcnt -DUSE_BARRIER_POOL
+barrier-avx2: $(TARGET)
+
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 

@@ -783,8 +783,14 @@ float *model_forward(model_t *m, int token, int pos) {
         /* ---- FFN (SwiGLU) ---- */
         rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim, c->rms_norm_eps);
 
+#ifdef USE_BARRIER_POOL
+        matmul_dual(s->hb, s->hb2, s->xb,
+                    lw->ffn_gate, lw->ffn_up,
+                    dim, n_ffn, lw->type_ffn_gate, lw->type_ffn_up);
+#else
         matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
         matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
+#endif
 
         silu(s->hb, n_ffn);
         elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);

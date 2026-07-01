@@ -18,6 +18,13 @@ int  tensor_get_threads(void);
  * Uses fused dequant+dot (no scratch buffer) and optional threading. */
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype);
 
+/* Dual matmul: out1[d] = W1[d,n] @ x[n], out2[d] = W2[d,n] @ x[n]
+ * Both matmuls share the same input x and are processed in one thread cycle.
+ * W1 and W2 must have the same input dimension n and output dimension d. */
+void matmul_dual(float *out1, float *out2, const float *x,
+                  const void *W1, const void *W2,
+                  int n, int d, gguf_type_t qtype1, gguf_type_t qtype2);
+
 /* Matrix-vector multiply with bias: out[d] = W[d, n] @ x[n] + b[d]
  * If b is NULL, bias is skipped. */
 void matmul_bias(float *out, const float *x, const void *W, const void *b,
