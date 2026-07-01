@@ -131,10 +131,24 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
 
 /* ---- mmap abstraction ---- */
 
+/* Prefault the mmap so inference doesn't pay page-fault cost.
+ * Touches one byte per page to bring all pages into RAM upfront.
+ * A ~4GB model has ~1M pages; prefaulting takes a few seconds at load
+ * but prevents a 30s+ page-fault storm during first inference. */
+static void prefault_mmap(const void *addr, size_t size) {
+    const volatile char *p = (const volatile char *)addr;
+    for (size_t off = 0; off < size; off += 4096)
+        (void)p[off];
+#ifdef __linux__
+    madvise((void*)addr, size, MADV_WILLNEED | MADV_SEQUENTIAL);
+#endif
+}
+
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                            OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Cannot open file: %s\n", path);
         return -1;
@@ -162,6 +176,7 @@ static int mmap_file(model_t *m, const char *path) {
     m->mmap_addr  = addr;
     m->file_handle = fh;
     m->map_handle  = mh;
+    prefault_mmap(addr, m->mmap_size);
 #else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -179,10 +194,10 @@ static int mmap_file(model_t *m, const char *path) {
         close(fd);
         return -1;
     }
-    madvise(addr, m->mmap_size, MADV_SEQUENTIAL);
 
     m->mmap_addr = addr;
     m->fd = fd;
+    prefault_mmap(addr, m->mmap_size);
 #endif
     return 0;
 }

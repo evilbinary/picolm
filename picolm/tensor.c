@@ -144,6 +144,7 @@ static void matmul_pool_wake(int nt) {
 
 static void matmul_pool_wait(int nt) {
 #ifdef _WIN32
+    (void)nt;
     WaitForSingleObject(pool_done_event, INFINITE);
 #else
     pthread_mutex_lock(&pool_mutex);
