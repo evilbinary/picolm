@@ -3,6 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Forward declarations */
+static void build_gpt2_byte_table(void);
+static int byte_linear_lookup(const tokenizer_t *t, const uint8_t *data, int len);
+
+typedef struct { uint8_t data[4]; int len; } gpt2_byte_t;
+static gpt2_byte_t gpt2_byte_table[256];
+
 /* ---- GGUF string reader (reused from model.c logic) ---- */
 
 static uint64_t read_u64_at(const uint8_t **p) {
@@ -30,9 +37,13 @@ static int vocab_lookup(const tokenizer_t *t, const char *str, int len) {
         int idx = t->sorted_idx[mid];
         int cmp = strncmp(t->vocab[idx], str, (size_t)len);
         if (cmp == 0) {
-            /* Check exact length match */
-            if (t->vocab[idx][len] == '\0') return idx;
-            if (t->vocab[idx][len] > '\0') { hi = mid - 1; }
+            /* Check exact length match.
+             * Cast to unsigned char: bytes >= 0x80 are negative on signed-char platforms
+             * (Windows/MinGW), which would send the binary search in the wrong direction
+             * when the vocab entry is longer than the search string. */
+            unsigned char next = (unsigned char)t->vocab[idx][len];
+            if (next == 0) return idx;
+            if (next > 0) { hi = mid - 1; }
             else { lo = mid + 1; }
         } else if (cmp < 0) {
             lo = mid + 1;
@@ -148,16 +159,14 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
 /* ---- GPT-2/tiktoken byte-to-Unicode mapping· ---- *
  * tiktoken mapping: 
  *   Bytes 0x21-0x7E (printable ASCII) → themselves (U+0021-U+007E)
- *   Bytes 0xA0-0xAC, 0xAE-0xFF (Latin-1) → themselves (U+00A0-U+00FF)
- *   Everything else (0x00-0x20, 0x7F-0x9F, 0xAD) → U+0100..
+ *   Bytes 0xA1-0xAC, 0xAE-0xFF (Latin-1) → themselves (U+00A1-U+00FF)
+ *   Everything else (0x00-0x20, 0x7F-0x9F, 0xA0, 0xAD) → U+0100..
  * See: https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
- * Corrected mapping: bytes that stay as Latin-1: 0x21-0x7E, 0xA0-0xAC, 0xAE-0xFF */
-typedef struct { uint8_t data[4]; int len; } gpt2_byte_t;
-static gpt2_byte_t gpt2_byte_table[256];
+ * Corrected mapping: bytes that stay as Latin-1: 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF */
 
 /* tiktoken special byte mapping:
- * Special (need mapping): 0x00-0x20, 0x7F-0x9F, 0xAD = 67 bytes
- * Non-special (stay as Latin-1): 0x21-0x7E, 0xA0-0xAC, 0xAE-0xFF = 189 bytes */
+ * Special (need mapping): 0x00-0x20, 0x7F-0x9F, 0xA0, 0xAD = 68 bytes
+ * Non-special (stay as Latin-1): 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF = 188 bytes */
 static const unsigned char tiktoken_special[256] = {
     /* 0x00-0x0F: 16 special */
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
@@ -179,8 +188,8 @@ static const unsigned char tiktoken_special[256] = {
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
     /* 0x90-0x9F: 16 special (C1 controls) */
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    /* 0xA0-0xAC: 13 non-special */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xA0: special, 0xA1-0xAC: 12 non-special */
+    1,0,0,0,0,0,0,0,0,0,0,0,0,
     /* 0xAD: 1 special (soft hyphen) */
     1,
     /* 0xAE-0xBF: 18 non-special */
@@ -361,10 +370,12 @@ static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_l
         if (i + clen > norm_len) clen = norm_len - i;
 
         int tok = -1;
+        int tok_strategy = 0;
 
         /* Strategy 1: Try multi-byte UTF-8 character via binary search */
         if (clen > 1) {
             tok = vocab_lookup(t, norm + i, clen);
+            if (tok >= 0) tok_strategy = 1;
         }
 
         /* Strategy 1b: Linear scan for multi-byte (if binary search failed,
@@ -374,6 +385,7 @@ static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_l
                 if ((int)strlen(t->vocab[vi]) == clen &&
                     memcmp(t->vocab[vi], norm + i, (size_t)clen) == 0) {
                     tok = vi;
+                    tok_strategy = 1;
                     break;
                 }
             }
@@ -385,6 +397,7 @@ static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_l
             build_gpt2_byte_table();
             tok = byte_linear_lookup(t, gpt2_byte_table[(unsigned char)norm[i]].data,
                                       gpt2_byte_table[(unsigned char)norm[i]].len);
+            if (tok >= 0) tok_strategy = 2;
         }
 
         if (tok < 0) {
@@ -392,6 +405,7 @@ static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_l
             char byte_tok[8];
             snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)norm[i]);
             tok = vocab_lookup(t, byte_tok, (int)strlen(byte_tok));
+            if (tok >= 0) tok_strategy = 3;
         }
 
         if (tok < 0) {
@@ -401,35 +415,11 @@ static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_l
 
         if (tok >= 0) {
             merge_buf[merge_len++] = tok;
+        } else {
+            fprintf(stderr, "Warning: byte 0x%02X has no token mapping\n",
+                    (unsigned char)norm[i]);
         }
-        if (tok < 0 && merge_len == 0 && i == 0) {
-            /* Debug: print first 25 vocab entries in hex */
-            fprintf(stderr, "[debug] can't encode byte 0x%02X\n", (unsigned char)norm[i]);
-            fprintf(stderr, "[debug] Vocab[0..5]:");
-            for (int d = 0; d < 6; d++) {
-                fprintf(stderr, " \"");
-                for (int k = 0; k < 8 && t->vocab[d][k]; k++)
-                    fprintf(stderr, "%02X ", (unsigned char)t->vocab[d][k]);
-                fprintf(stderr, "\"");
-            }
-            fprintf(stderr, "\n");
-            /* Scan for tokens starting with 0xE4 or 0xC3 (GPT-2 mapped 0xE4) */
-            fprintf(stderr, "[debug] scanning for 0xE4/0xC3+v=0xE4 tokens...\n");
-            unsigned char targets[] = {0xE4, 0xC3, 0x00};
-            for (int ti = 0; targets[ti]; ti++) {
-                int count = 0;
-                for (int vi = 0; vi < t->vocab_size && count < 3; vi++) {
-                    if ((unsigned char)t->vocab[vi][0] == targets[ti]) {
-                        fprintf(stderr, "  found @[%d]:", vi);
-                        for (int k = 0; k < 6 && t->vocab[vi][k]; k++)
-                            fprintf(stderr, " %02X", (unsigned char)t->vocab[vi][k]);
-                        fprintf(stderr, "\n");
-                        count++;
-                    }
-                }
-            }
-        }
-        i += (clen > 1 && tok >= 0) ? clen : 1;
+        i += (clen > 1 && tok_strategy == 1) ? clen : 1;
     }
     free(norm);
 
@@ -463,8 +453,8 @@ static uint8_t utf8_acc[6];
 static int     utf8_acc_len = 0;
 
 /* Qwen2/GPT-2 decode: convert GPT-2 byte-encoded token string to clean text.
- * GPT-2 maps special bytes (0x00-0x20, 0x7F-0x9F, 0xAD) to U+0100+ range.
- * Non-special bytes (0x21-0x7E, 0x80-0xFF) stay as Latin-1 (U+0021-U+007E, U+0080-U+00FF).
+ * GPT-2 maps special bytes (0x00-0x20, 0x7F-0x9F, 0xA0, 0xAD) to U+0100-U+0143 range.
+ * Non-special bytes (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) stay as Latin-1 (U+0021-U+007E, U+00A1-U+00AC, U+00AE-U+00FF).
  * We need to reverse the Latin-1 mapping back to raw bytes for UTF-8 reconstruction. */
 static void decode_qwen_str(const char *str, char *out, int out_max) {
     int j = 0;
@@ -478,10 +468,10 @@ static void decode_qwen_str(const char *str, char *out, int out_max) {
         else if (c >= 0xC2) utf8_len = 2;
 
         if (utf8_len == 2) {
-            /* 2-byte UTF-8: could be U+0080-U+00FF (Latin-1) or U+0100-U+01FF (special) */
+            /* 2-byte UTF-8: could be U+0080-U+00FF (Latin-1) or U+0100-U+0143 (special) */
             unsigned int cp = ((unsigned int)(c & 0x1F) << 6) | ((unsigned int)str[i+1] & 0x3F);
 
-            if (cp >= 0x0100 && cp <= 0x0142) {
+            if (cp >= 0x0100 && cp <= 0x0143) {
                 /* Special bytes mapped to U+0100+ range */
                 int orig_byte;
                 if (cp <= 0x0120) {
@@ -491,7 +481,10 @@ static void decode_qwen_str(const char *str, char *out, int out_max) {
                     /* U+0121-U+0141 -> bytes 0x7F-0x9F */
                     orig_byte = 0x7F + (cp - 0x0121);
                 } else if (cp == 0x0142) {
-                    /* U+0142 -> byte 0xAD */
+                    /* U+0142 -> byte 0xA0 (non-breaking space) */
+                    orig_byte = 0xA0;
+                } else if (cp == 0x0143) {
+                    /* U+0143 -> byte 0xAD (soft hyphen) */
                     orig_byte = 0xAD;
                 } else {
                     orig_byte = -1;
@@ -503,9 +496,14 @@ static void decode_qwen_str(const char *str, char *out, int out_max) {
                     out[j++] = str[i+1];
                 }
                 i++;
-            } else if (cp >= 0x0080 && cp <= 0x00FF) {
-                /* Latin-1 range: convert back to raw byte */
+            } else if ((cp >= 0x00A1 && cp <= 0x00AC) || cp >= 0x00AE) {
+                /* Latin-1 non-special range: convert back to raw byte */
                 out[j++] = (char)cp;
+                i++;
+            } else if (cp >= 0x0080 && cp <= 0x00FF) {
+                /* Special bytes 0xA0/0xAD in Latin-1 range - output original UTF-8 */
+                out[j++] = str[i];
+                out[j++] = str[i+1];
                 i++;
             } else {
                 /* Other 2-byte UTF-8 (shouldn't happen for GPT-2 tokens) */

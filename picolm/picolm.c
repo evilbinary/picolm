@@ -61,7 +61,39 @@ static char *read_stdin(void) {
     return buf;
 }
 
+#ifdef _WIN32
+/* Convert Windows ANSI (system codepage, e.g. GBK) string to UTF-8.
+ * Returns malloc'd buffer, caller must free. */
+static char *win_ansi_to_utf8(const char *ansi_str) {
+    if (!ansi_str || !*ansi_str) return NULL;
+    /* Step 1: ANSI -> UTF-16 */
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansi_str, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    wchar_t *wide = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wide) return NULL;
+    MultiByteToWideChar(CP_ACP, 0, ansi_str, -1, wide, wlen);
+
+    /* Step 2: UTF-16 -> UTF-8 */
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    char *utf8 = (char *)malloc((size_t)ulen);
+    if (utf8) {
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, ulen, NULL, NULL);
+    }
+    free(wide);
+    return utf8;
+}
+#endif
+
+#include <locale.h>
+
 int main(int argc, char **argv) {
+    // setlocale(LC_ALL, "zh_CN.UTF-8");
+    printf("你好，我是PicoLLM\n");
+    
+#ifdef _WIN32
+    /* Set console output to UTF-8 so Chinese text displays correctly */
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -69,6 +101,7 @@ int main(int argc, char **argv) {
 
     const char *model_path = argv[1];
     const char *prompt = NULL;
+    char *converted_prompt = NULL;  /* owned by us if we converted encoding */
     int    max_tokens = 256;
     float  temperature = 0.8f;
     float  top_p = 0.9f;
@@ -81,7 +114,19 @@ int main(int argc, char **argv) {
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+#ifdef _WIN32
+            /* Only convert from ANSI (e.g. GBK) to UTF-8 if the console is
+             * not already UTF-8. When the terminal uses UTF-8 (CP 65001),
+             * argv is already UTF-8 and conversion would corrupt it. */
+            if (GetConsoleCP() != CP_UTF8) {
+                converted_prompt = win_ansi_to_utf8(argv[++i]);
+                prompt = converted_prompt ? converted_prompt : argv[i];
+            } else {
+                prompt = argv[++i];
+            }
+#else
             prompt = argv[++i];
+#endif
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
@@ -229,6 +274,7 @@ int main(int argc, char **argv) {
             /* Stop on EOS or grammar completion */
             if (next == (int)tokenizer.eos_id) break;
             if (grammar_is_complete(&grammar)) break;
+            if (total_gen >= max_tokens) break;
         }
 
         token = next;
@@ -267,6 +313,9 @@ int main(int argc, char **argv) {
     free(prompt_tokens);
     free(stdin_prompt);
     tokenizer_free(&tokenizer);
+#ifdef _WIN32
+    free(converted_prompt);
+#endif
     model_free(&model);
 
     return 0;
