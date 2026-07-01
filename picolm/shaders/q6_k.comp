@@ -1,0 +1,107 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer XBuf  { float xbuf[]; };
+layout(binding = 1, std430) readonly buffer WBuf  { uint wbuf[]; };
+layout(binding = 2, std430) buffer       OutBuf  { float outbuf[]; };
+
+layout(push_constant) uniform PC {
+    int dim_n;
+    int dim_d;
+    int row_bytes;
+} pc;
+
+uint get_byte(int i) {
+    return (wbuf[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
+}
+
+uint get_u16(int i) {
+    return get_byte(i) | (get_byte(i + 1) << 8u);
+}
+
+float f16tof32(uint h) {
+    uint s = h >> 15;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0) {
+        if (m == 0) return 0.0;
+        float v = float(m) / 16777216.0;
+        return (s == 0 ? v : -v);
+    } else if (e == 31) {
+        return m == 0 ? (s == 0 ? 1.0 / 0.0 : -1.0 / 0.0) : 0.0 / 0.0;
+    } else {
+        float v = float(uint((e + 112) << 23) | (m << 13));
+        return (s == 0 ? v : -v);
+    }
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= uint(pc.dim_d)) return;
+
+    int nb = pc.dim_n / 256;
+    float sumf = 0.0;
+
+    for (int b = 0; b < nb; b++) {
+        int boff = int(row) * pc.row_bytes + b * 210;  /* byte offset in w */
+
+        float d_val = f16tof32(get_u16(boff + 208));
+
+        /* Read scales[16] at byte offset 192 (int8, sign-extend) */
+        int scales[16];
+        for (int i = 0; i < 16; i++) {
+            uint b = get_byte(boff + 192 + i);
+            scales[i] = int(b) - (int((b >> 7) & 1u) << 8);
+        }
+
+        float sums[16] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+        /* Two chunks of 128 elements each */
+        for (int c = 0; c < 2; c++) {
+            int is = c * 8;
+            int x_off = b * 256 + c * 128;
+            int ql_off = boff + c * 64;         /* ql[128] at offset 0 */
+            int qh_off = boff + 128 + c * 32;   /* qh[64] at offset 128 */
+
+            /* l = 0..15 */
+            for (int l = 0; l < 16; l++) {
+                uint ql_lo = get_byte(ql_off + l);
+                uint ql_hi = get_byte(ql_off + l + 32);
+                uint qh_b  = get_byte(qh_off + l);
+
+                int q1 = int((ql_lo & 0xFu) | (((qh_b >> 0) & 3u) << 4u)) - 32;
+                int q2 = int((ql_hi & 0xFu) | (((qh_b >> 2) & 3u) << 4u)) - 32;
+                int q3 = int((ql_lo >> 4u)  | (((qh_b >> 4) & 3u) << 4u)) - 32;
+                int q4 = int((ql_hi >> 4u)  | (((qh_b >> 6) & 3u) << 4u)) - 32;
+
+                sums[is + 0] += float(q1) * xbuf[x_off + l];
+                sums[is + 2] += float(q2) * xbuf[x_off + l + 32];
+                sums[is + 4] += float(q3) * xbuf[x_off + l + 64];
+                sums[is + 6] += float(q4) * xbuf[x_off + l + 96];
+            }
+            /* l = 16..31 */
+            for (int l = 16; l < 32; l++) {
+                uint ql_lo = get_byte(ql_off + l);
+                uint ql_hi = get_byte(ql_off + l + 32);
+                uint qh_b  = get_byte(qh_off + l);
+
+                int q1 = int((ql_lo & 0xFu) | (((qh_b >> 0) & 3u) << 4u)) - 32;
+                int q2 = int((ql_hi & 0xFu) | (((qh_b >> 2) & 3u) << 4u)) - 32;
+                int q3 = int((ql_lo >> 4u)  | (((qh_b >> 4) & 3u) << 4u)) - 32;
+                int q4 = int((ql_hi >> 4u)  | (((qh_b >> 6) & 3u) << 4u)) - 32;
+
+                sums[is + 1] += float(q1) * xbuf[x_off + l];
+                sums[is + 3] += float(q2) * xbuf[x_off + l + 32];
+                sums[is + 5] += float(q3) * xbuf[x_off + l + 64];
+                sums[is + 7] += float(q4) * xbuf[x_off + l + 96];
+            }
+        }
+
+        for (int j = 0; j < 16; j++)
+            sumf += d_val * float(scales[j]) * sums[j];
+    }
+
+    outbuf[row] = sumf;
+}

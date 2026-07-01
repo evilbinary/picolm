@@ -25,6 +25,40 @@ barrier-avx2: $(TARGET)
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# --- Vulkan Compute backend ---
+VULKAN_SDK_ROOT ?= E:/soft/VulkanSDK/1.4.350.0
+VULKAN_SRCS = $(SRCS) gpu.c
+
+vulkan: CFLAGS += -DUSE_VULKAN -I$(VULKAN_SDK_ROOT)/Include
+vulkan: LDFLAGS += -L$(VULKAN_SDK_ROOT)/Lib -lvulkan-1
+vulkan: shaders/spv/q4_k.spv shaders/spv/q6_k.spv shaders/spv/q8_0.spv
+vulkan: $(VULKAN_SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(VULKAN_SRCS) $(LDFLAGS)
+
+# Cross-platform: Linux (system-installed Vulkan)
+vulkan-linux: CFLAGS += -DUSE_VULKAN
+vulkan-linux: LDFLAGS += -lvulkan
+vulkan-linux: shaders/spv/q4_k.spv shaders/spv/q6_k.spv shaders/spv/q8_0.spv
+vulkan-linux: $(VULKAN_SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(VULKAN_SRCS) $(LDFLAGS)
+
+vulkan-mac: CFLAGS += -DUSE_VULKAN
+vulkan-mac: LDFLAGS += -lMoltenVK -framework Cocoa -framework IOKit
+vulkan-mac: shaders/spv/q4_k.spv shaders/spv/q6_k.spv shaders/spv/q8_0.spv
+vulkan-mac: $(VULKAN_SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(VULKAN_SRCS) $(LDFLAGS)
+
+# --- Shader compilation ---
+SHADER_COMPILER ?= "$(VULKAN_SDK_ROOT)/Bin/glslangValidator"
+SHADER_SRCS = shaders/q4_k.comp shaders/q6_k.comp shaders/q8_0.comp
+SHADER_SPV  = $(SHADER_SRCS:shaders/%.comp=shaders/spv/%.spv)
+
+shaders/spv/%.spv: shaders/%.comp
+	@mkdir -p shaders/spv
+	$(SHADER_COMPILER) -V --target-env vulkan1.2 -o $@ $<
+
+shaders: $(SHADER_SPV)
+
 # --- Static build for single-binary deployment ---
 static: CFLAGS += -march=native
 static: LDFLAGS += -static

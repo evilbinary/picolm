@@ -1,6 +1,9 @@
 #include "tensor.h"
 #include "model.h"  /* for rope_type_t */
 #include "quant.h"
+#ifdef USE_VULKAN
+#include "gpu.h"
+#endif
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -183,6 +186,10 @@ int tensor_get_threads(void) {
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+#ifdef USE_VULKAN
+    if (gpu_try_matmul(out, x, W, n, d, qtype) == 0)
+        return;  /* GPU handled it */
+#endif
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
@@ -244,6 +251,15 @@ void matmul_bias(float *out, const float *x, const void *W, const void *b,
 void matmul_dual(float *out1, float *out2, const float *x,
                   const void *W1, const void *W2,
                   int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+#ifdef USE_VULKAN
+    if (gpu_available()) {
+        int ok1 = gpu_try_matmul(out1, x, W1, n, d, qtype1);
+        int ok2 = gpu_try_matmul(out2, x, W2, n, d, qtype2);
+        if (ok1 == 0 && ok2 == 0) return;
+        /* If one succeeded but not the other, fall through to CPU for both
+         * (the output buffer for the GPU one is already filled) */
+    }
+#endif
     size_t row_bytes  = gguf_type_row_size(qtype1, n);
     size_t row_bytes2 = gguf_type_row_size(qtype2, n);
     const char *w1 = (const char *)W1;

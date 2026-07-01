@@ -1,0 +1,61 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer XBuf  { float xbuf[]; };
+layout(binding = 1, std430) readonly buffer WBuf  { uint wbuf[]; };
+layout(binding = 2, std430) buffer       OutBuf  { float outbuf[]; };
+
+layout(push_constant) uniform PC {
+    int dim_n;
+    int dim_d;
+    int row_bytes;
+} pc;
+
+uint get_byte(int i) {
+    return (wbuf[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
+}
+
+uint get_u16(int i) {
+    return get_byte(i) | (get_byte(i + 1) << 8u);
+}
+
+float f16tof32(uint h) {
+    uint s = h >> 15;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0) {
+        if (m == 0) return 0.0;
+        float v = float(m) / 16777216.0;
+        return (s == 0 ? v : -v);
+    } else if (e == 31) {
+        return m == 0 ? (s == 0 ? 1.0 / 0.0 : -1.0 / 0.0) : 0.0 / 0.0;
+    } else {
+        float v = float(uint((e + 112) << 23) | (m << 13));
+        return (s == 0 ? v : -v);
+    }
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= uint(pc.dim_d)) return;
+
+    int nb = pc.dim_n / 32;
+    float sum = 0.0;
+
+    for (int b = 0; b < nb; b++) {
+        int boff = int(row) * pc.row_bytes + b * 34;
+
+        float d_val = f16tof32(get_u16(boff));
+
+        int x_off = b * 32;
+        for (int l = 0; l < 32; l++) {
+            float xv = xbuf[x_off + l];
+            uint bv = get_byte(boff + 2 + l);
+            float wv = d_val * float(int(bv) - (int((bv >> 7) & 1u) << 8));
+            sum += wv * xv;
+        }
+    }
+
+    outbuf[row] = sum;
+}

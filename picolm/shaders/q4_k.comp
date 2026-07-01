@@ -1,0 +1,103 @@
+#version 460
+
+/* Use uint array for byte-addressable weight data: each uint holds 4 bytes (LE) */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer XBuf    { float xbuf[]; };
+layout(binding = 1, std430) readonly buffer WBuf    { uint wbuf[]; };
+layout(binding = 2, std430) buffer       OutBuf    { float outbuf[]; };
+
+layout(push_constant) uniform PC {
+    int dim_n;
+    int dim_d;
+    int row_bytes;
+} pc;
+
+/* Extract byte at index i from uint array wbuf (little-endian) */
+uint get_byte(int i) {
+    return (wbuf[i >> 2] >> ((i & 3) << 3)) & 0xFFu;
+}
+
+uint get_u16(int i) {
+    return get_byte(i) | (get_byte(i + 1) << 8u);
+}
+
+/* FP16 -> FP32 (IEEE 754-2008) */
+float f16tof32(uint h) {
+    uint s = h >> 15;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0) {
+        if (m == 0) return 0.0;
+        float v = float(m) / 16777216.0;
+        return (s == 0 ? v : -v);
+    } else if (e == 31) {
+        return m == 0 ? (s == 0 ? 1.0 / 0.0 : -1.0 / 0.0) : 0.0 / 0.0;
+    } else {
+        float v = float(uint((e + 112) << 23) | (m << 13));
+        return (s == 0 ? v : -v);
+    }
+}
+
+/* Unpack 6-bit scale/min from packed scales[12] at block byte offset `boff` */
+void get_sk4(int idx, int boff,
+             out uint sc, out uint mn) {
+    if (idx < 4) {
+        sc = get_byte(boff + 4 + idx) & 63u;
+        mn = get_byte(boff + 8 + idx) & 63u;
+    } else {
+        uint b0 = get_byte(boff + idx);        /* = scales[idx-4] at byte 4+(idx-4) */
+        uint b1 = get_byte(boff + 8 + idx);    /* = scales[idx+4] at byte 4+(idx+4) */
+        sc = (b1 & 0xFu) | ((b0 >> 6) << 4u);
+        mn = (b1 >> 4u) | ((get_byte(boff + 4 + idx) >> 6) << 4u);
+    }
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= uint(pc.dim_d)) return;
+
+    int nb = pc.dim_n / 256;
+    float sum = 0.0;
+
+    for (int b = 0; b < nb; b++) {
+        int boff = int(row) * pc.row_bytes + b * 144;  /* byte offset in w */
+
+        float d_val  = f16tof32(get_u16(boff));
+        float dm_val = f16tof32(get_u16(boff + 2));
+
+        /* 4 sub-block pairs, 64 elements each */
+        for (int j = 0; j < 4; j++) {
+            int is = j * 2;
+
+            uint sc0, mn0, sc1, mn1;
+            get_sk4(is,   boff, sc0, mn0);
+            get_sk4(is+1, boff, sc1, mn1);
+
+            float d1 = d_val * float(sc0);
+            float m1 = dm_val * float(mn0);
+            float d2 = d_val * float(sc1);
+            float m2 = dm_val * float(mn1);
+
+            int base = b * 256 + j * 64;
+            int qs_off = boff + 16 + j * 32;  /* qs starts at byte 16 */
+
+            /* First 32 (scale sc0/mn0) */
+            for (int l = 0; l < 32; l++) {
+                uint nib = get_byte(qs_off + l / 2);
+                nib = (nib >> ((l & 1) * 4)) & 0xFu;
+                float xv = xbuf[base + l];
+                sum += d1 * float(nib) * xv - m1 * xv;
+            }
+            /* Second 32 (scale sc1/mn1) — byte offset +16 for second sub-block */
+            for (int l = 0; l < 32; l++) {
+                uint nib = get_byte(qs_off + 16 + l / 2);
+                nib = (nib >> ((l & 1) * 4)) & 0xFu;
+                float xv = xbuf[base + 32 + l];
+                sum += d2 * float(nib) * xv - m2 * xv;
+            }
+        }
+    }
+
+    outbuf[row] = sum;
+}

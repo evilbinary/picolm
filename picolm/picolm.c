@@ -3,6 +3,9 @@
 #include "tokenizer.h"
 #include "sampler.h"
 #include "grammar.h"
+#ifdef USE_VULKAN
+#include "gpu.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,6 +187,15 @@ int main(int argc, char **argv) {
 
     tensor_set_threads(num_threads);
 
+#ifdef USE_VULKAN
+    if (gpu_init(&model) == 0) {
+        gpu_upload_model(&model);
+        fprintf(stderr, "GPU: Vulkan compute enabled\n");
+    } else {
+        fprintf(stderr, "GPU: disabled, falling back to CPU\n");
+    }
+#endif
+
     /* Load tokenizer */
     tokenizer_t tokenizer;
     if (tokenizer_load(&tokenizer, &model) != 0) {
@@ -315,6 +327,9 @@ int main(int argc, char **argv) {
     tokenizer_free(&tokenizer);
 #ifdef _WIN32
     free(converted_prompt);
+#endif
+#ifdef USE_VULKAN
+    gpu_shutdown();
 #endif
     model_free(&model);
 
