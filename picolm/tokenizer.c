@@ -155,26 +155,46 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
 typedef struct { uint8_t data[4]; int len; } gpt2_byte_t;
 static gpt2_byte_t gpt2_byte_table[256];
 
+/* tiktoken special byte mapping:
+ * Special (need mapping): 0x00-0x20, 0x7F-0x9F, 0xAD = 67 bytes
+ * Non-special (stay as Latin-1): 0x21-0x7E, 0xA0-0xAC, 0xAE-0xFF = 189 bytes */
 static const unsigned char tiktoken_special[256] = {
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  /* 00-0F */
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  /* 10-1F */
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  /* 20 - 32 is 'special' (mapped to U+0100+) */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 21-2F: ASCII printable */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 30-3F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 40-4F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 50-5F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 60-6F */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* 70-7E */
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  /* 7F-8F: special */
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  /* 90-9F: special */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,         /* A0-AC: Latin-1 printable */
-    1,                                   /* AD: special */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* AE-BF: Latin-1 */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* C0-CF */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* D0-DF */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* E0-EF */
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* F0-FF */
+    /* 0x00-0x0F: 16 special */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0x10-0x1F: 16 special */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0x20: special (space), 0x21-0x2F: 15 non-special */
+    1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x30-0x3F: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x40-0x4F: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x50-0x5F: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x60-0x6F: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0x70-0x7E: 15 non-special, 0x7F: special (DEL) */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,
+    /* 0x80-0x8F: 16 special (C1 controls) */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0x90-0x9F: 16 special (C1 controls) */
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    /* 0xA0-0xAC: 13 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xAD: 1 special (soft hyphen) */
+    1,
+    /* 0xAE-0xBF: 18 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xC0-0xCF: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xD0-0xDF: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xE0-0xEF: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    /* 0xF0-0xFF: 16 non-special */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 };
+/* Verify: 16+16+1+15*6+1+16+16+13+1+18+16*4 = 33+90+33+14+82 = 256 ✓ */
 
 static void build_gpt2_byte_table(void) {
     static int built = 0;
@@ -229,11 +249,75 @@ static int byte_linear_lookup(const tokenizer_t *t, const uint8_t *data, int len
     return -1;
 }
 
-/* ---- Core BPE encode: split text into byte tokens, then BPE merge ---- */
+/* Forward declaration */
+static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_len,
+                              int *tokens, int max_tokens, int add_space_marker);
+
+/* ---- Core BPE encode: handle special tokens first, then BPE for normal text ---- */
 static int bpe_encode_core(const tokenizer_t *t, const char *text,
                            int *tokens, int max_tokens,
                            int add_space_marker) {
-    int text_len = (int)strlen(text);
+    int n_tokens = 0;
+
+    /* Qwen2 special tokens - handle before BPE */
+    const char *specials[] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
+    };
+    int n_specials = sizeof(specials) / sizeof(specials[0]);
+
+    const char *curr = text;
+    while (*curr && n_tokens < max_tokens) {
+        /* Try to match special token first */
+        int special_id = -1;
+        int special_len = 0;
+
+        for (int i = 0; i < n_specials; i++) {
+            int slen = (int)strlen(specials[i]);
+            if (strncmp(curr, specials[i], (size_t)slen) == 0) {
+                int id = vocab_lookup(t, specials[i], slen);
+                if (id != -1) {
+                    special_id = id;
+                    special_len = slen;
+                    break;
+                }
+            }
+        }
+
+        if (special_id != -1) {
+            /* Found special token */
+            tokens[n_tokens++] = special_id;
+            curr += special_len;
+        } else {
+            /* Find next special token position */
+            const char *next_special = NULL;
+            for (const char *p = curr + 1; *p; p++) {
+                for (int i = 0; i < n_specials; i++) {
+                    if (strncmp(p, specials[i], strlen(specials[i])) == 0) {
+                        next_special = p;
+                        break;
+                    }
+                }
+                if (next_special) break;
+            }
+
+            int seg_len = next_special ? (int)(next_special - curr) : (int)strlen(curr);
+            if (seg_len == 0) break;
+
+            /* Encode this segment with BPE */
+            int encoded = encode_bpe_segment(t, curr, seg_len, tokens + n_tokens, max_tokens - n_tokens, add_space_marker);
+            n_tokens += encoded;
+            curr += seg_len;
+        }
+    }
+
+    return n_tokens;
+}
+
+/* Encode a segment without special tokens */
+static int encode_bpe_segment(const tokenizer_t *t, const char *text, int text_len,
+                              int *tokens, int max_tokens, int add_space_marker) {
+    if (text_len <= 0) return 0;
 
     /* Build normalized text */
     int norm_cap;
@@ -379,40 +463,73 @@ static uint8_t utf8_acc[6];
 static int     utf8_acc_len = 0;
 
 /* Qwen2/GPT-2 decode: convert GPT-2 byte-encoded token string to clean text.
- * Ġ (C4 A0) -> space, Ċ (C4 8A) -> newline, Latin-1 range -> raw bytes. */
+ * GPT-2 maps special bytes (0x00-0x20, 0x7F-0x9F, 0xAD) to U+0100+ range.
+ * Non-special bytes (0x21-0x7E, 0x80-0xFF) stay as Latin-1 (U+0021-U+007E, U+0080-U+00FF).
+ * We need to reverse the Latin-1 mapping back to raw bytes for UTF-8 reconstruction. */
 static void decode_qwen_str(const char *str, char *out, int out_max) {
     int j = 0;
     for (int i = 0; str[i] && j < out_max - 1; i++) {
         unsigned char c = (unsigned char)str[i];
-        /* Ġ (U+0120, UTF-8: C4 A0) -> space */
-        if (c == 0xC4 && (unsigned char)str[i+1] == 0xA0) {
-            out[j++] = ' '; i++;
-        }
-        /* Ċ (U+010A, UTF-8: C4 8A) -> newline */
-        else if (c == 0xC4 && (unsigned char)str[i+1] == 0x8A) {
-            out[j++] = '\n'; i++;
-        }
-        /* Latin-1 range (U+0080-U+00FF): decode to raw byte */
-        else if ((c == 0xC2 || c == 0xC3) && (unsigned char)str[i+1] >= 0x80) {
-            unsigned int cp = ((unsigned int)(c & 0x1F) << 6) | (unsigned int)(str[i+1] & 0x3F);
-            if (cp >= 0x80 && cp <= 0xFF && cp != 0xAD) {
-                out[j++] = (char)cp; i++;
+
+        /* Check for UTF-8 lead byte */
+        int utf8_len = 1;
+        if (c >= 0xF0) utf8_len = 4;
+        else if (c >= 0xE0) utf8_len = 3;
+        else if (c >= 0xC2) utf8_len = 2;
+
+        if (utf8_len == 2) {
+            /* 2-byte UTF-8: could be U+0080-U+00FF (Latin-1) or U+0100-U+01FF (special) */
+            unsigned int cp = ((unsigned int)(c & 0x1F) << 6) | ((unsigned int)str[i+1] & 0x3F);
+
+            if (cp >= 0x0100 && cp <= 0x0142) {
+                /* Special bytes mapped to U+0100+ range */
+                int orig_byte;
+                if (cp <= 0x0120) {
+                    /* U+0100-U+0120 -> bytes 0x00-0x20 */
+                    orig_byte = cp - 0x0100;
+                } else if (cp <= 0x0141) {
+                    /* U+0121-U+0141 -> bytes 0x7F-0x9F */
+                    orig_byte = 0x7F + (cp - 0x0121);
+                } else if (cp == 0x0142) {
+                    /* U+0142 -> byte 0xAD */
+                    orig_byte = 0xAD;
+                } else {
+                    orig_byte = -1;
+                }
+                if (orig_byte >= 0) {
+                    out[j++] = (char)orig_byte;
+                } else {
+                    out[j++] = str[i];
+                    out[j++] = str[i+1];
+                }
+                i++;
+            } else if (cp >= 0x0080 && cp <= 0x00FF) {
+                /* Latin-1 range: convert back to raw byte */
+                out[j++] = (char)cp;
+                i++;
             } else {
+                /* Other 2-byte UTF-8 (shouldn't happen for GPT-2 tokens) */
                 out[j++] = str[i];
+                out[j++] = str[i+1];
+                i++;
             }
+        } else if (utf8_len == 3) {
+            /* 3-byte UTF-8: Chinese characters etc. - keep as-is */
+            out[j++] = str[i];
+            out[j++] = str[i+1];
+            out[j++] = str[i+2];
+            i += 2;
+        } else if (utf8_len == 4) {
+            /* 4-byte UTF-8 - keep as-is */
+            out[j++] = str[i];
+            out[j++] = str[i+1];
+            out[j++] = str[i+2];
+            out[j++] = str[i+3];
+            i += 3;
+        } else {
+            /* ASCII byte - keep as-is */
+            out[j++] = str[i];
         }
-        /* <0xHH> byte tokens */
-        else if (c == '<' && str[i+1] == '0' && str[i+2] == 'x' && str[i+5] == '>') {
-            unsigned int val = 0;
-            for (int k = 3; k < 5; k++) {
-                val <<= 4; char ch = str[i+k];
-                if (ch >= '0' && ch <= '9') val += (unsigned)(ch - '0');
-                else if (ch >= 'A' && ch <= 'F') val += (unsigned)(ch - 'A' + 10);
-                else if (ch >= 'a' && ch <= 'f') val += (unsigned)(ch - 'a' + 10);
-            }
-            out[j++] = (char)val; i += 5;
-        }
-        else { out[j++] = str[i]; }
     }
     out[j] = '\0';
 }
