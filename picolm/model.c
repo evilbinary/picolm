@@ -667,7 +667,14 @@ int model_load(model_t *m, const char *path, int max_seq_len) {
  *   - Pre-computed RoPE tables (table lookup instead of trig)
  * ================================================================ */
 
+/* Forward declaration for internal helper used by draft/verify */
+static float *model_forward_ex(model_t *m, int token, int pos, int max_layers);
+
 float *model_forward(model_t *m, int token, int pos) {
+    return model_forward_ex(m, token, pos, m->config.n_layers);
+}
+
+static float *model_forward_ex(model_t *m, int token, int pos, int max_layers) {
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -694,7 +701,7 @@ float *model_forward(model_t *m, int token, int pos) {
     }
 
     /* 2. Transformer layers */
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int l = 0; l < max_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
 
         /* ---- Attention ---- */
@@ -969,3 +976,42 @@ int kvcache_load(model_t *m, const char *path) {
     fprintf(stderr, "KV cache loaded: %d positions from %s\n", n_pos, path);
     return n_pos;
 }
+
+#ifdef USE_SPECULATIVE
+
+#include <stdlib.h>
+
+void draft_init(draft_state_t *ds, const model_t *m) {
+    ds->K = 4;
+    const char *env = getenv("PICOLM_SPEC_K");
+    if (env) {
+        int k = atoi(env);
+        if (k >= 1 && k <= MAX_SPEC_K) ds->K = k;
+    }
+    ds->draft_layers = m->config.n_layers / 2;
+    const char *l_env = getenv("PICOLM_SPEC_LAYERS");
+    if (l_env) {
+        int l = atoi(l_env);
+        if (l >= 1 && l <= m->config.n_layers) ds->draft_layers = l;
+    }
+    memset(ds->candidates, 0, sizeof(ds->candidates));
+    fprintf(stderr, "Spec: K=%d draft_layers=%d/%d\n",
+            ds->K, ds->draft_layers, m->config.n_layers);
+}
+
+float *model_forward_draft(model_t *m, int token, int pos, int max_layers) {
+    return model_forward_ex(m, token, pos, max_layers);
+}
+
+int model_forward_batch(model_t *m, const int *tokens, int pos, int K,
+                         float *logits_out) {
+    int vocab_size = m->config.vocab_size;
+    for (int i = 0; i < K; i++) {
+        float *logits = model_forward_ex(m, tokens[i], pos + i, m->config.n_layers);
+        memcpy(logits_out + (size_t)i * vocab_size, logits,
+               (size_t)vocab_size * sizeof(float));
+    }
+    return 0;
+}
+
+#endif /* USE_SPECULATIVE */

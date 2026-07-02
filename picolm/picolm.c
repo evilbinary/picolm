@@ -6,6 +6,9 @@
 #ifdef USE_VULKAN
 #include "gpu.h"
 #endif
+#ifdef USE_SPECULATIVE
+#include "model.h"  /* draft_state_t, MAX_SPEC_K */
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -242,6 +245,110 @@ int main(int argc, char **argv) {
     double t_start = get_time_ms();
     double t_first_token = 0;
 
+#ifdef USE_SPECULATIVE
+    {
+        draft_state_t ds;
+        draft_init(&ds, &model);
+        int K_val = ds.K;
+        int vocab_size = model.config.vocab_size;
+
+        int token = prompt_tokens[start_pos > 0 ? start_pos - 1 : 0];
+        int pos = start_pos > 0 ? start_pos - 1 : 0;
+        int total_steps = n_prompt + max_tokens;
+        if (total_steps > model.config.max_seq_len) {
+            total_steps = model.config.max_seq_len;
+        }
+
+        while (pos < total_steps) {
+            /* Prefill: same as non-spec path */
+            if (pos < n_prompt - 1) {
+                model_forward(&model, token, pos);
+                pos++;
+                token = prompt_tokens[pos];
+                continue;
+            }
+            if (pos == n_prompt - 1)
+                t_first_token = get_time_ms();
+
+            /* --- Draft: generate K candidates (half layers, greedy) --- */
+            int eff_K = K_val;
+            if (eff_K > total_steps - pos) eff_K = total_steps - pos;
+
+            int saved_token = token;
+            for (int i = 0; i < eff_K; i++) {
+                float *dl = model_forward_draft(&model, token, pos + i, ds.draft_layers);
+                ds.candidates[i] = 0;
+                float best = dl[0];
+                for (int v = 1; v < vocab_size; v++) {
+                    if (dl[v] > best) { best = dl[v]; ds.candidates[i] = v; }
+                }
+                token = ds.candidates[i];
+            }
+
+            /* --- Verify each candidate with full model (sequential) --- */
+            token = saved_token;
+            int accepted = 0;
+
+            for (int i = 0; i < eff_K; i++) {
+                float *logits = model_forward(&model, token, pos + i);
+                int target = 0;
+                float best = logits[0];
+                for (int v = 1; v < vocab_size; v++) {
+                    if (logits[v] > best) { best = logits[v]; target = v; }
+                }
+
+                if (target == ds.candidates[i]) {
+                    /* Accept */
+                    const char *piece = tokenizer_decode(&tokenizer, token, ds.candidates[i]);
+                    printf("%s", piece); fflush(stdout);
+                    total_gen++;
+                    accepted++;
+                    token = ds.candidates[i];
+                    if (token == (int)tokenizer.eos_id) goto spec_done;
+                    if (total_gen >= max_tokens) goto spec_done;
+                } else {
+                    /* Reject: sample from full model distribution */
+                    grammar_apply(&grammar, logits, vocab_size);
+                    int corrected = sampler_sample(&sampler, logits, vocab_size);
+                    grammar_advance(&grammar, &tokenizer, corrected);
+                    const char *piece = tokenizer_decode(&tokenizer, token, corrected);
+                    printf("%s", piece); fflush(stdout);
+                    total_gen++;
+                    pos += i + 1;
+                    token = corrected;
+                    if (token == (int)tokenizer.eos_id) goto spec_done;
+                    if (grammar_is_complete(&grammar)) goto spec_done;
+                    if (total_gen >= max_tokens) goto spec_done;
+                    goto spec_continue;
+                }
+            }
+
+            /* All K accepted: sample one more from the full model */
+            {
+                float *logits = model_forward(&model, token, pos + eff_K - 1);
+                grammar_apply(&grammar, logits, vocab_size);
+                int next = sampler_sample(&sampler, logits, vocab_size);
+                grammar_advance(&grammar, &tokenizer, next);
+                const char *piece = tokenizer_decode(&tokenizer, token, next);
+                printf("%s", piece); fflush(stdout);
+                total_gen++;
+                pos += eff_K;
+                token = next;
+                if (token == (int)tokenizer.eos_id) goto spec_done;
+                if (grammar_is_complete(&grammar)) goto spec_done;
+                if (total_gen >= max_tokens) goto spec_done;
+            }
+
+        spec_continue:
+            continue;
+        }
+
+    spec_done:
+        (void)0;
+    }  /* end spec scope */
+
+#else  /* !USE_SPECULATIVE */
+
     int token = prompt_tokens[start_pos > 0 ? start_pos - 1 : 0];
     int pos = start_pos > 0 ? start_pos - 1 : 0;
     int total_steps = n_prompt + max_tokens;
@@ -291,6 +398,8 @@ int main(int argc, char **argv) {
 
         token = next;
     }
+
+#endif /* USE_SPECULATIVE */
 
     printf("\n");
     double t_end = get_time_ms();

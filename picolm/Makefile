@@ -25,7 +25,24 @@ barrier-avx2: $(TARGET)
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# --- Speculative Decoding (self-speculation with batched verification) ---
+spec: CFLAGS += -march=native -DUSE_SPECULATIVE
+spec: $(TARGET)
+
+spec-avx2: CFLAGS += -O3 -mavx2 -mfma -mpopcnt -DUSE_SPECULATIVE
+spec-avx2: $(TARGET)
+
+# Combined: speculative + Vulkan
+spec-vulkan: CFLAGS += -DUSE_SPECULATIVE -DUSE_VULKAN -I$(VULKAN_SDK_ROOT)/Include
+spec-vulkan: LDFLAGS += -L$(VULKAN_SDK_ROOT)/Lib -lvulkan-1
+spec-vulkan: shaders/spv/q4_k.spv shaders/spv/q6_k.spv shaders/spv/q8_0.spv
+spec-vulkan: $(VULKAN_SRCS)
+		$(CC) $(CFLAGS) -o $(TARGET) $(VULKAN_SRCS) $(LDFLAGS)
+
 # --- Vulkan Compute backend ---
+# Runtime env vars:
+#   PICOLM_GPU_FORCE=1   use integrated GPU (skipped by default)
+#   PICOLM_GPU_LAYERS=N   offload only first N layers (default: all)
 VULKAN_SDK_ROOT ?= E:/soft/VulkanSDK/1.4.350.0
 VULKAN_SRCS = $(SRCS) gpu.c
 
