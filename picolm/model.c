@@ -148,9 +148,27 @@ static void prefault_mmap(const void *addr, size_t size) {
 }
 
 #ifdef _WIN32
-/* Try to load model into huge pages (2MB) to reduce TLB misses.
- * Returns 0 on success, -1 on failure (caller falls back to normal mmap). */
-static int mmap_file_huge(model_t *m, const char *path) {
+/* Read a large file into a buffer in chunks (ReadFile DWORD limit is ~4GB). */
+static int read_file_full(HANDLE fh, void *buf, size_t size) {
+    uint8_t *p = (uint8_t *)buf;
+    while (size > 0) {
+        DWORD chunk = (DWORD)(size > 0x7FFFFFFF ? 0x7FFFFFFF : size);
+        DWORD read;
+        if (!ReadFile(fh, p, chunk, &read, NULL) || read != chunk)
+            return -1;
+        p += read;
+        size -= read;
+    }
+    return 0;
+}
+
+/* Load model file into a private buffer via VirtualAlloc + ReadFile.
+ * Avoids MapViewOfFile because Windows Defender's real-time protection
+ * can scan every page fault on large mmap'd files, killing throughput.
+ *
+ * First tries 2MB huge pages (reduces TLB misses ~500x), falls back
+ * to normal 4KB pages if huge pages are not available. */
+static int mmap_file_alloc(model_t *m, const char *path) {
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) return -1;
@@ -158,27 +176,46 @@ static int mmap_file_huge(model_t *m, const char *path) {
     LARGE_INTEGER fsize;
     GetFileSizeEx(fh, &fsize);
     m->mmap_size = (size_t)fsize.QuadPart;
+
+    /* Try large pages first — 2MB pages instead of 4KB → ~1750 TLB entries
+     * instead of ~875K for a 3.5GB model */
     SIZE_T large_min = GetLargePageMinimum();
-    if (large_min == 0) { CloseHandle(fh); return -1; }
+    if (large_min > 0) {
+        SIZE_T alloc_size = ((m->mmap_size + large_min - 1) / large_min) * large_min;
 
-    SIZE_T alloc_size = ((m->mmap_size + large_min - 1) / large_min) * large_min;
+        HANDLE hToken;
+        TOKEN_PRIVILEGES tp;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
+            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+            CloseHandle(hToken);
+        }
 
-    /* Enable SeLockMemoryPrivilege (needed for VirtualAlloc large pages) */
-    HANDLE hToken;
-    TOKEN_PRIVILEGES tp;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
-        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-        CloseHandle(hToken);
+        void *buf = VirtualAlloc(NULL, alloc_size,
+                                 MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                 PAGE_READWRITE);
+        if (buf) {
+            if (read_file_full(fh, buf, m->mmap_size) == 0) {
+                CloseHandle(fh);
+                m->mmap_addr  = buf;
+                m->file_handle = NULL;
+                m->map_handle  = (void*)(intptr_t)-1;
+                fprintf(stderr, "Model loaded: %zu MB (%zu MB huge pages, 2MB)\n",
+                        m->mmap_size >> 20, alloc_size >> 20);
+                return 0;
+            }
+            VirtualFree(buf, 0, MEM_RELEASE);
+        }
     }
 
-    void *buf = VirtualAlloc(NULL, alloc_size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    /* Fall back to normal 4KB pages */
+    void *buf = VirtualAlloc(NULL, m->mmap_size,
+                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!buf) { CloseHandle(fh); return -1; }
 
-    DWORD read;
-    if (!ReadFile(fh, buf, (DWORD)m->mmap_size, &read, NULL) || (size_t)read != m->mmap_size) {
+    if (read_file_full(fh, buf, m->mmap_size) != 0) {
         VirtualFree(buf, 0, MEM_RELEASE);
         CloseHandle(fh);
         return -1;
@@ -187,18 +224,18 @@ static int mmap_file_huge(model_t *m, const char *path) {
 
     m->mmap_addr  = buf;
     m->file_handle = NULL;
-    m->map_handle  = (void*)(intptr_t)-1; /* signal: VirtualFree, not UnmapViewOfFile */
-    fprintf(stderr, "Loaded model into %zu MB huge pages\n", alloc_size >> 20);
+    m->map_handle  = (void*)(intptr_t)-1;
+    fprintf(stderr, "Model loaded: %zu MB\n", m->mmap_size >> 20);
     return 0;
 }
 #endif
 
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
-    /* Try huge pages first — they eliminate TLB miss overhead on 3+ GB scans */
-    if (mmap_file_huge(m, path) == 0) return 0;
+    /* VirtualAlloc + ReadFile path (handles huge pages too) */
+    if (mmap_file_alloc(m, path) == 0) return 0;
 
-    /* Fall back to normal file mapping */
+    /* Ultimate fallback: traditional file mapping */
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -229,6 +266,7 @@ static int mmap_file(model_t *m, const char *path) {
     m->mmap_addr  = addr;
     m->file_handle = fh;
     m->map_handle  = mh;
+    fprintf(stderr, "Model loaded: %zu MB (file mapping)\n", m->mmap_size >> 20);
     prefault_mmap(addr, m->mmap_size);
 #else
     int fd = open(path, O_RDONLY);
