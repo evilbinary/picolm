@@ -110,7 +110,7 @@ static void *matmul_worker_loop(void *arg) {
         matmul_worker_task(&pool_tasks[tid]);
         pthread_mutex_lock(&pool_mutex);
         pool_done++;
-        pthread_cond_signal(&pool_cond);
+        pthread_cond_broadcast(&pool_cond);
     }
     pthread_mutex_unlock(&pool_mutex);
     return NULL;
