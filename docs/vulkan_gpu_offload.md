@@ -84,14 +84,24 @@ void gpu_shutdown(void);                 // 释放所有资源
 
 Push constants 传 `{ n, d, row_bytes }`，descriptor set 绑定 `{ x staging buffer, W device buffer, out staging buffer }`。
 
-### 回退策略
+### 运行时环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PICOLM_GPU_FORCE=1` | 无 | 跳过集成 GPU 检测，强制使用 iGPU（如 Intel UHD 630） |
+| `PICOLM_GPU_LAYERS=N` | 全部层 | 只卸载前 N 层到 GPU，其余层走 CPU。VRAM 不足时使用 |
+
+示例：`PICOLM_GPU_FORCE=1 PICOLM_GPU_LAYERS=8 ./picolm model.gguf -p "Hello"`
+
+## 回退策略
 
 | 场景 | 行为 |
 |------|------|
 | `USE_VULKAN` 未定义 | stub 全 return -1，CPU path 编译时完全不变 |
 | 无 Vulkan driver/设备 | `gpu_init` 失败，`gpu_available()=0` |
-| VRAM 不足 | `gpu_init` 失败 |
+| VRAM 不足 | 设置 `PICOLM_GPU_LAYERS=N` 减少 GPU 层数后重试 |
 | 某 tensor 类型不支持 | 不在 lookup 表里，`gpu_try_matmul` 失败，CPU 处理 |
+| 集成 GPU 性能不足 | 自动跳过（`PICOLM_GPU_FORCE=1` 覆盖） |
 
 ## 实现步骤
 
