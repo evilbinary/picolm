@@ -169,35 +169,7 @@ void model_free(model_t *m);
 int kvcache_save(const model_t *m, const char *path, int n_pos);
 int kvcache_load(model_t *m, const char *path);
 
-/* ---- Speculative Decoding (optional, compile with -DUSE_SPECULATIVE) ---- */
-
-#ifdef USE_SPECULATIVE
-
-/* Draft state for self-speculation */
-#define MAX_SPEC_K 16
-
-typedef struct {
-    int candidates[MAX_SPEC_K];      /* K draft tokens */
-    int K;                           /* number of candidates per round */
-    int draft_layers;                /* layers to run in draft mode */
-} draft_state_t;
-
-/* Initialize draft state (call once after model_load) */
-void draft_init(draft_state_t *ds, const model_t *m);
-
-/* Draft forward: run only the first max_layers of the model.
- * Returns pointer to draft logits [vocab_size]. */
-float *model_forward_draft(model_t *m, int token, int pos, int max_layers);
-
-/* Batched verification: run K tokens through the full model in one pass.
- * Fills logits_out[K * vocab_size] with one logit vector per candidate.
- * Returns 0 on success, -1 to fall back to sequential. */
-int model_forward_batch(model_t *m, const int *tokens, int pos, int K,
-                         float *logits_out);
-
-#else
-/* Stub: speculative decoding not compiled in */
+/* (speculative decoding removed; placeholder kept for compatibility) */
 #define MAX_SPEC_K 1
-#endif
 
 #endif /* MODEL_H */
