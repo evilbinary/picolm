@@ -415,35 +415,36 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
             __m256 sum_qx2_v = _mm256_setzero_ps();
             __m256 sum_x2_v  = _mm256_setzero_ps();
 
-            for (int l = 0; l < 32; l += 8) {
-                /* Load 8 bytes of quantized data */
-                __m128i qbytes = _mm_loadl_epi64((const __m128i *)(q + l));
+            /* Prefetch next cache line */
+            _mm_prefetch((const char*)(q + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(xp + 64), _MM_HINT_T0);
 
-                /* Expand 8-bit to 16-bit for easier nibble extraction */
-                __m128i q_16 = _mm_cvtepu8_epi16(qbytes);
+            /* Process 16 bytes at a time — 2 iterations instead of 4 */
+            for (int l = 0; l < 32; l += 16) {
+                __m128i q16 = _mm_loadu_si128((const __m128i*)(q + l));
 
-                /* Extract low nibbles: AND 0xF */
-                __m128i q_lo_16 = _mm_and_si128(q_16, _mm_set1_epi16(0xF));
+                __m128i lo16 = _mm_and_si128(q16, _mm_set1_epi8(0x0F));
+                __m128i hi16 = _mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F));
 
-                /* Extract high nibbles: shift right 4 bits */
-                __m128i q_hi_16 = _mm_srli_epi16(q_16, 4);
+                /* Low nibbles: bytes 0-7 → x[l..l+7], 8-15 → x[l+8..l+15] */
+                __m256i lo16_0 = _mm256_cvtepu8_epi16(lo16);
+                __m256 lo_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo16_0)));
+                __m256 lo_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(lo16_0, 1)));
+                __m256 x_l0 = _mm256_loadu_ps(xp + l);
+                __m256 x_l1 = _mm256_loadu_ps(xp + l + 8);
+                sum_qx1_v = _mm256_fmadd_ps(lo_f_a0, x_l0, sum_qx1_v);
+                sum_qx1_v = _mm256_fmadd_ps(lo_f_a1, x_l1, sum_qx1_v);
+                sum_x1_v  = _mm256_add_ps(sum_x1_v, _mm256_add_ps(x_l0, x_l1));
 
-                /* Expand to 32-bit integers */
-                __m256i q_lo_32 = _mm256_cvtepu16_epi32(q_lo_16);
-                __m256i q_hi_32 = _mm256_cvtepu16_epi32(q_hi_16);
-
-                /* Convert to float */
-                __m256 qf_lo = _mm256_cvtepi32_ps(q_lo_32);
-                __m256 qf_hi = _mm256_cvtepi32_ps(q_hi_32);
-
-                /* Load input vectors and accumulate */
-                __m256 xv_lo = _mm256_loadu_ps(xp + l);
-                __m256 xv_hi = _mm256_loadu_ps(xp + l + 32);
-
-                sum_qx1_v = _mm256_fmadd_ps(qf_lo, xv_lo, sum_qx1_v);
-                sum_x1_v  = _mm256_add_ps(sum_x1_v, xv_lo);
-                sum_qx2_v = _mm256_fmadd_ps(qf_hi, xv_hi, sum_qx2_v);
-                sum_x2_v  = _mm256_add_ps(sum_x2_v, xv_hi);
+                /* High nibbles: bytes 0-7 → x[l+32..l+39], 8-15 → x[l+40..l+47] */
+                __m256i hi16_0 = _mm256_cvtepu8_epi16(hi16);
+                __m256 hi_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi16_0)));
+                __m256 hi_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(hi16_0, 1)));
+                __m256 x_h0 = _mm256_loadu_ps(xp + l + 32);
+                __m256 x_h1 = _mm256_loadu_ps(xp + l + 40);
+                sum_qx2_v = _mm256_fmadd_ps(hi_f_a0, x_h0, sum_qx2_v);
+                sum_qx2_v = _mm256_fmadd_ps(hi_f_a1, x_h1, sum_qx2_v);
+                sum_x2_v  = _mm256_add_ps(sum_x2_v, _mm256_add_ps(x_h0, x_h1));
             }
 
             float sum_qx1 = hsum_avx2(sum_qx1_v);
