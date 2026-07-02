@@ -525,6 +525,63 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
         const int8_t  *sc = blocks[i].scales;
         const float *xp = x + i * 256;
 
+#if defined(PICOLM_AVX2)
+        float sums[16];
+        memset(sums, 0, sizeof(sums));
+        for (int chunk = 0; chunk < 2; chunk++) {
+            const uint8_t *ql_c = ql + chunk * 64;
+            const uint8_t *qh_c = qh + chunk * 32;
+            const float *xp_c = xp + chunk * 128;
+            int is = chunk * 8;
+
+            __m128i ql0 = _mm_loadu_si128((const __m128i*)(ql_c));
+            __m128i ql1 = _mm_loadu_si128((const __m128i*)(ql_c + 16));
+            __m128i ql2 = _mm_loadu_si128((const __m128i*)(ql_c + 32));
+            __m128i ql3 = _mm_loadu_si128((const __m128i*)(ql_c + 48));
+            __m128i qh0 = _mm_loadu_si128((const __m128i*)(qh_c));
+            __m128i qh1 = _mm_loadu_si128((const __m128i*)(qh_c + 16));
+            __m128i mF = _mm_set1_epi8(0x0F);
+            __m128i m3 = _mm_set1_epi8(3);
+
+            /* even groups */
+            __m128i e_q1 = _mm_or_si128(_mm_and_si128(ql0, mF), _mm_slli_epi16(_mm_and_si128(qh0, m3), 4));
+            __m128i e_q2 = _mm_or_si128(_mm_and_si128(ql2, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 2), m3), 4));
+            __m128i e_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 4), m3), 4));
+            __m128i e_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql2, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 6), m3), 4));
+
+            /* odd groups */
+            __m128i o_q1 = _mm_or_si128(_mm_and_si128(ql1, mF), _mm_slli_epi16(_mm_and_si128(qh1, m3), 4));
+            __m128i o_q2 = _mm_or_si128(_mm_and_si128(ql3, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 2), m3), 4));
+            __m128i o_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 4), m3), 4));
+            __m128i o_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql3, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4));
+
+#define Q6_GROUP_SUM(qvals, xpos) ({ \
+    __m256i _e16 = _mm256_cvtepu8_epi16(qvals); \
+    __m128i _l = _mm256_castsi256_si128(_e16); \
+    __m128i _h = _mm256_extracti128_si256(_e16, 1); \
+    __m256 _fl = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_l)), _mm256_set1_ps(32.0f)); \
+    __m256 _fh = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_h)), _mm256_set1_ps(32.0f)); \
+    __m256 _p = _mm256_fmadd_ps(_fl, _mm256_loadu_ps(xp_c + (xpos)), \
+               _mm256_mul_ps(_fh, _mm256_loadu_ps(xp_c + (xpos) + 8))); \
+    hsum_avx2(_p); \
+})
+
+            sums[is+0] = Q6_GROUP_SUM(e_q1, 0);
+            sums[is+2] = Q6_GROUP_SUM(e_q2, 32);
+            sums[is+4] = Q6_GROUP_SUM(e_q3, 64);
+            sums[is+6] = Q6_GROUP_SUM(e_q4, 96);
+            sums[is+1] = Q6_GROUP_SUM(o_q1, 16);
+            sums[is+3] = Q6_GROUP_SUM(o_q2, 48);
+            sums[is+5] = Q6_GROUP_SUM(o_q3, 80);
+            sums[is+7] = Q6_GROUP_SUM(o_q4, 112);
+
+#undef Q6_GROUP_SUM
+        }
+
+        for (int j = 0; j < 16; j++) {
+            sumf += d * (float)sc[j] * sums[j];
+        }
+#else
         /* Accumulate per-scale-group sums: 16 groups of 16 elements each */
         float sums[16] = {0};
 
@@ -559,7 +616,94 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
         for (int j = 0; j < 16; j++) {
             sumf += d * (float)sc[j] * sums[j];
         }
+#endif
     }
+    return sumf;
+}
+
+/* ---- vec_dot_q8_0_f32 ---- */
+
+float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
+    const block_q8_0 *blocks = (const block_q8_0 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+#if defined(PICOLM_AVX2)
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d);
+        __m256i qs = _mm256_loadu_si256((const __m256i*)(blocks[i].qs));
+
+        /* Expand int8 → int16 (low and high halves) */
+        __m256i qs_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qs));
+        __m256i qs_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qs, 1));
+
+        /* int16 → int32 → float */
+        __m256 f_lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(qs_lo)));
+        __m256 f_hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(qs_lo, 1)));
+        __m256 f_lo2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(qs_hi)));
+        __m256 f_hi2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(qs_hi, 1)));
+
+        __m256 x0 = _mm256_loadu_ps(x + i * 32);
+        __m256 x1 = _mm256_loadu_ps(x + i * 32 + 8);
+        __m256 x2 = _mm256_loadu_ps(x + i * 32 + 16);
+        __m256 x3 = _mm256_loadu_ps(x + i * 32 + 24);
+
+        __m256 p0 = _mm256_mul_ps(f_lo, x0);
+        __m256 p1 = _mm256_mul_ps(f_hi, x1);
+        __m256 p2 = _mm256_mul_ps(f_lo2, x2);
+        __m256 p3 = _mm256_mul_ps(f_hi2, x3);
+
+        __m256 acc = _mm256_add_ps(_mm256_add_ps(p0, p1), _mm256_add_ps(p2, p3));
+        sumf += d * hsum_avx2(acc);
+    }
+#elif defined(PICOLM_NEON)
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d);
+        int8x16_t qs0 = vld1q_s8(blocks[i].qs);
+        int8x16_t qs1 = vld1q_s8(blocks[i].qs + 16);
+
+        int16x8_t qs0_lo = vmovl_s8(vget_low_s8(qs0));
+        int16x8_t qs0_hi = vmovl_s8(vget_high_s8(qs0));
+        int16x8_t qs1_lo = vmovl_s8(vget_low_s8(qs1));
+        int16x8_t qs1_hi = vmovl_s8(vget_high_s8(qs1));
+
+        float32x4_t x0 = vld1q_f32(x + i * 32);
+        float32x4_t x1 = vld1q_f32(x + i * 32 + 4);
+        float32x4_t x2 = vld1q_f32(x + i * 32 + 8);
+        float32x4_t x3 = vld1q_f32(x + i * 32 + 12);
+        float32x4_t x4 = vld1q_f32(x + i * 32 + 16);
+        float32x4_t x5 = vld1q_f32(x + i * 32 + 20);
+        float32x4_t x6 = vld1q_f32(x + i * 32 + 24);
+        float32x4_t x7 = vld1q_f32(x + i * 32 + 28);
+
+        float32x4_t acc = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(qs0_lo))), x0);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qs0_lo))), x1);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qs0_hi))), x2);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qs0_hi))), x3);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qs1_lo))), x4);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qs1_lo))), x5);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(qs1_hi))), x6);
+        acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(qs1_hi))), x7);
+
+        sumf += d * vaddvq_f32_compat(acc);
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d);
+        float sum = 0.0f;
+        /* process 2 at a time for better ILP */
+        int j = 0;
+        for (; j + 1 < 32; j += 2) {
+            sum += (float)blocks[i].qs[j]   * x[j] +
+                   (float)blocks[i].qs[j+1] * x[j+1];
+        }
+        for (; j < 32; j++) {
+            sum += (float)blocks[i].qs[j] * x[j];
+        }
+        sumf += d * sum;
+        x += 32;
+    }
+#endif
     return sumf;
 }
 
@@ -569,6 +713,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q6_K: return vec_dot_q6_K_f32(src, x, n);
+        case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         default: {
             /* Fallback: dequantize to temp buffer, then dot */

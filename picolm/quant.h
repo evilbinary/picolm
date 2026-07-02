@@ -147,6 +147,7 @@ size_t gguf_type_row_size(gguf_type_t type, int n);
 /* ---- Fused dot products (dequant + dot in one pass, no scratch buffer) ---- */
 float vec_dot_q4_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_K_f32(const void *src, const float *x, int n);
+float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
