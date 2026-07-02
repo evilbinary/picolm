@@ -13,6 +13,16 @@ void tensor_init_scratch(float *buf, int size);
 void tensor_set_threads(int t);
 int  tensor_get_threads(void);
 
+/* Batch matmul: out[n_batch × d] = x[n_batch × n] @ W[n × d]
+ * Weight W is read once for all n_batch inputs (prefill optimization). */
+void matmul_batch(float *out, const float *x, int n_batch,
+                   const void *W, int n, int d, gguf_type_t qtype);
+
+/* Dual batch matmul: same as matmul_batch but two output matrices. */
+void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
+                        const void *W1, const void *W2,
+                        int n, int d, gguf_type_t qtype1, gguf_type_t qtype2);
+
 /* Matrix-vector multiply: out[d] = W[d, n] @ x[n]
  * W is quantized in the given type, stored row-major.
  * Uses fused dequant+dot (no scratch buffer) and optional threading. */

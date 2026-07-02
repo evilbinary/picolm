@@ -37,6 +37,8 @@ typedef struct {
     const char  *W2;       /* second weight matrix (dual matmul), NULL otherwise */
     size_t       row_bytes;
     int          n;        /* input dimension */
+    int          d;        /* output dimension (weight rows) */
+    int          n_batch;  /* >1 = batch mode, 1 = single */
     int          start;    /* first output row */
     int          end;      /* one past last output row */
     gguf_type_t  qtype;
@@ -64,18 +66,29 @@ static pthread_cond_t  pool_cond   = PTHREAD_COND_INITIALIZER;
 
 /* The actual work: vec_dot over a range of output rows */
 static void matmul_worker_task(matmul_task_t *t) {
+    int nb = t->n_batch > 0 ? t->n_batch : 1;
+
     if (t->W2) {
         /* Dual matmul: two weight matrices, same input, possibly different qtypes */
         size_t row_bytes2 = gguf_type_row_size(t->qtype2, t->n);
         for (int i = t->start; i < t->end; i++) {
-            float dot = vec_dot(t->W + (size_t)i * t->row_bytes, t->x, t->n, t->qtype);
-            t->out[i] = dot;
-            t->out2[i] = vec_dot(t->W2 + (size_t)i * row_bytes2, t->x, t->n, t->qtype2);
+            const char *wrow1 = t->W + (size_t)i * t->row_bytes;
+            const char *wrow2 = t->W2 + (size_t)i * row_bytes2;
+            t->out[i] = vec_dot(wrow1, t->x, t->n, t->qtype);
+            t->out2[i] = vec_dot(wrow2, t->x, t->n, t->qtype2);
+            for (int b = 1; b < nb; b++) {
+                const float *xb = t->x + b * t->n;
+                t->out[b * t->d + i] = vec_dot(wrow1, xb, t->n, t->qtype);
+                t->out2[b * t->d + i] = vec_dot(wrow2, xb, t->n, t->qtype2);
+            }
         }
     } else {
         for (int i = t->start; i < t->end; i++) {
-            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
-                                t->x, t->n, t->qtype);
+            const char *wrow = t->W + (size_t)i * t->row_bytes;
+            t->out[i] = vec_dot(wrow, t->x, t->n, t->qtype);
+            for (int b = 1; b < nb; b++) {
+                t->out[b * t->d + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
+            }
         }
     }
 }
@@ -222,6 +235,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         task->W2        = NULL;
         task->row_bytes = row_bytes;
         task->n         = n;
+        task->d         = d;
+        task->n_batch   = 1;
         task->qtype     = qtype;
         task->start     = row;
         row += rows_per + (t < extra ? 1 : 0);
@@ -291,6 +306,106 @@ void matmul_dual(float *out1, float *out2, const float *x,
         task->W2        = w2;
         task->row_bytes = row_bytes;
         task->n         = n;
+        task->d         = d;
+        task->n_batch   = 1;
+        task->qtype     = qtype1;
+        task->qtype2    = qtype2;
+        task->start     = row;
+        row += rows_per + (t < extra ? 1 : 0);
+        task->end       = row;
+    }
+
+    matmul_pool_wake(nt);
+    matmul_worker_task(&pool_tasks[0]);
+    matmul_pool_wait(nt);
+}
+
+void matmul_batch(float *out, const float *x, int n_batch,
+                   const void *W, int n, int d, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+
+    if (n_threads <= 1 || n_batch * d < 4) {
+        for (int i = 0; i < d; i++) {
+            const char *wrow = wptr + (size_t)i * row_bytes;
+            for (int b = 0; b < n_batch; b++)
+                out[b * d + i] = vec_dot(wrow, x + b * n, n, qtype);
+        }
+        return;
+    }
+
+    int nt = n_threads;
+    if (nt > d) nt = d;
+
+    if (pool_nworkers <= 0) matmul_pool_init(nt);
+
+    int rows_per = d / nt;
+    int extra = d % nt;
+    int row = 0;
+
+    for (int t = 0; t < nt; t++) {
+        matmul_task_t *task = &pool_tasks[t];
+        task->out       = out;
+        task->out2      = NULL;
+        task->x         = x;
+        task->W         = wptr;
+        task->W2        = NULL;
+        task->row_bytes = row_bytes;
+        task->n         = n;
+        task->d         = d;
+        task->n_batch   = n_batch;
+        task->qtype     = qtype;
+        task->start     = row;
+        row += rows_per + (t < extra ? 1 : 0);
+        task->end       = row;
+    }
+
+    matmul_pool_wake(nt);
+    matmul_worker_task(&pool_tasks[0]);
+    matmul_pool_wait(nt);
+}
+
+void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
+                        const void *W1, const void *W2,
+                        int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    size_t row_bytes  = gguf_type_row_size(qtype1, n);
+    size_t row_bytes2 = gguf_type_row_size(qtype2, n);
+    const char *w1 = (const char *)W1;
+    const char *w2 = (const char *)W2;
+
+    if (n_threads <= 1 || n_batch * d < 4) {
+        for (int i = 0; i < d; i++) {
+            const char *wrow1 = w1 + (size_t)i * row_bytes;
+            const char *wrow2 = w2 + (size_t)i * row_bytes2;
+            for (int b = 0; b < n_batch; b++) {
+                const float *xb = x + b * n;
+                out1[b * d + i] = vec_dot(wrow1, xb, n, qtype1);
+                out2[b * d + i] = vec_dot(wrow2, xb, n, qtype2);
+            }
+        }
+        return;
+    }
+
+    int nt = n_threads;
+    if (nt > d) nt = d;
+
+    if (pool_nworkers <= 0) matmul_pool_init(nt);
+
+    int rows_per = d / nt;
+    int extra = d % nt;
+    int row = 0;
+
+    for (int t = 0; t < nt; t++) {
+        matmul_task_t *task = &pool_tasks[t];
+        task->out       = out1;
+        task->out2      = out2;
+        task->x         = x;
+        task->W         = w1;
+        task->W2        = w2;
+        task->row_bytes = row_bytes;
+        task->n         = n;
+        task->d         = d;
+        task->n_batch   = n_batch;
         task->qtype     = qtype1;
         task->qtype2    = qtype2;
         task->start     = row;

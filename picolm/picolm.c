@@ -223,69 +223,55 @@ int main(int argc, char **argv) {
     int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
 
     /* If cache covers part of the prompt, skip those positions */
-    int start_pos = 0;
+    int prefill_start = 0;
     if (cache_pos > 0 && cache_pos <= n_prompt) {
-        start_pos = cache_pos;
-        fprintf(stderr, "Skipping %d cached prompt tokens\n", start_pos);
+        prefill_start = cache_pos;
+        fprintf(stderr, "Skipping %d cached prompt tokens\n", prefill_start);
     }
 
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
             n_prompt, max_tokens, temperature, top_p, num_threads);
     fprintf(stderr, "---\n");
 
-    /* Generation loop */
-    int total_gen = 0;
+    /* Batch prefill: process all non-cached prompt tokens at once */
     double t_start = get_time_ms();
-    double t_first_token = 0;
-
-    int token = prompt_tokens[start_pos > 0 ? start_pos - 1 : 0];
-    int pos = start_pos > 0 ? start_pos - 1 : 0;
-    int total_steps = n_prompt + max_tokens;
-    if (total_steps > model.config.max_seq_len) {
-        total_steps = model.config.max_seq_len;
+    int remaining = n_prompt - prefill_start;
+    if (remaining > 0) {
+        model_forward_prefill(&model, prompt_tokens + prefill_start, remaining, prefill_start);
     }
 
-    for (; pos < total_steps; pos++) {
-        /* Determine which token to feed */
-        if (pos < start_pos) {
-            /* This shouldn't happen given our start logic, but safety */
-            token = prompt_tokens[pos];
-            continue;
-        }
+    /* Generation loop */
+    int total_gen = 0;
+    double t_first_token = get_time_ms();
 
-        /* Forward pass */
-        float *logits = model_forward(&model, token, pos);
+    int token = prompt_tokens[n_prompt - 1];
+    int pos = n_prompt - 1;
+    float *logits = model.state.logits;
 
-        int next;
-        if (pos < n_prompt - 1) {
-            /* Prefill: use next prompt token */
-            next = prompt_tokens[pos + 1];
-        } else {
-            /* Generation: apply grammar constraints, then sample */
-            if (pos == n_prompt - 1) {
-                t_first_token = get_time_ms();
-            }
+    while (total_gen < max_tokens && pos + 1 < n_prompt + max_tokens &&
+           pos + 1 <= model.config.max_seq_len) {
+        /* Apply grammar constraints, then sample */
+        grammar_apply(&grammar, logits, model.config.vocab_size);
+        int next = sampler_sample(&sampler, logits, model.config.vocab_size);
 
-            grammar_apply(&grammar, logits, model.config.vocab_size);
-            next = sampler_sample(&sampler, logits, model.config.vocab_size);
+        /* Update grammar state with the generated token */
+        grammar_advance(&grammar, &tokenizer, next);
 
-            /* Update grammar state with the generated token */
-            grammar_advance(&grammar, &tokenizer, next);
+        /* Decode and print */
+        const char *piece = tokenizer_decode(&tokenizer, token, next);
+        printf("%s", piece);
+        fflush(stdout);
 
-            /* Decode and print */
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
-            printf("%s", piece);
-            fflush(stdout);
+        total_gen++;
 
-            total_gen++;
+        /* Stop on EOS or grammar completion */
+        if (next == (int)tokenizer.eos_id) break;
+        if (grammar_is_complete(&grammar)) break;
 
-            /* Stop on EOS or grammar completion */
-            if (next == (int)tokenizer.eos_id) break;
-            if (grammar_is_complete(&grammar)) break;
-            if (total_gen >= max_tokens) break;
-        }
-
+        /* Next step */
+        pos++;
         token = next;
+        logits = model_forward(&model, token, pos);
     }
 
     printf("\n");
@@ -298,17 +284,16 @@ int main(int argc, char **argv) {
 
     /* Stats */
     double total_time = (t_end - t_start) / 1000.0;
-    if (t_first_token == 0) t_first_token = t_end; /* no generation happened */
     double gen_time = (t_end - t_first_token) / 1000.0;
     double prefill_time = (t_first_token - t_start) / 1000.0;
-    int actual_prefill = n_prompt - start_pos;
+    int actual_prefill = n_prompt - prefill_start;
     if (actual_prefill < 0) actual_prefill = 0;
 
     fprintf(stderr, "---\n");
     fprintf(stderr, "Prefill: %d tokens in %.2fs (%.1f tok/s)%s\n",
             actual_prefill, prefill_time,
             prefill_time > 0 ? (double)actual_prefill / prefill_time : 0,
-            start_pos > 0 ? " [partially cached]" : "");
+            prefill_start > 0 ? " [partially cached]" : "");
     fprintf(stderr, "Generation: %d tokens in %.2fs (%.1f tok/s)\n",
             total_gen, gen_time,
             gen_time > 0 ? (double)total_gen / gen_time : 0);

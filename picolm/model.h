@@ -161,6 +161,12 @@ int model_load(model_t *m, const char *path, int max_seq_len);
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);
 
+/* Batch prefill: process n_tokens prompt tokens at once.
+ * Fills KV cache for all positions start_pos..start_pos+n_tokens-1.
+ * After return, s->logits contains logits for the LAST token in the batch.
+ * n_tokens must be <= MAX_BATCH. */
+void model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos);
+
 /* Free all resources. */
 void model_free(model_t *m);
 
