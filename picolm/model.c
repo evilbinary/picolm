@@ -148,94 +148,68 @@ static void prefault_mmap(const void *addr, size_t size) {
 }
 
 #ifdef _WIN32
-/* Read a large file into a buffer in chunks (ReadFile DWORD limit is ~4GB). */
-static int read_file_full(HANDLE fh, void *buf, size_t size) {
-    uint8_t *p = (uint8_t *)buf;
-    while (size > 0) {
-        DWORD chunk = (DWORD)(size > 0x7FFFFFFF ? 0x7FFFFFFF : size);
-        DWORD read;
-        if (!ReadFile(fh, p, chunk, &read, NULL) || read != chunk)
-            return -1;
-        p += read;
-        size -= read;
-    }
-    return 0;
-}
-
-/* Load model file into a private buffer via VirtualAlloc + ReadFile.
- * Avoids MapViewOfFile because Windows Defender's real-time protection
- * can scan every page fault on large mmap'd files, killing throughput.
- *
- * First tries 2MB huge pages (reduces TLB misses ~500x), falls back
- * to normal 4KB pages if huge pages are not available. */
-static int mmap_file_alloc(model_t *m, const char *path) {
+/* Try to load the model into 2MB huge pages to reduce TLB misses.
+ * This reduces TLB entries from ~1.1M (4KB) to ~2200 (2MB) for a 4.5GB model.
+ * Requires SeLockMemoryPrivilege (configurable via Local Security Policy).
+ * Falls back silently if huge pages are unavailable. */
+static int mmap_file_huge(model_t *m, const char *path) {
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) return -1;
 
     LARGE_INTEGER fsize;
     GetFileSizeEx(fh, &fsize);
-    m->mmap_size = (size_t)fsize.QuadPart;
-
-    /* Try large pages first — 2MB pages instead of 4KB → ~1750 TLB entries
-     * instead of ~875K for a 3.5GB model */
+    size_t file_size = (size_t)fsize.QuadPart;
     SIZE_T large_min = GetLargePageMinimum();
-    if (large_min > 0) {
-        SIZE_T alloc_size = ((m->mmap_size + large_min - 1) / large_min) * large_min;
+    if (large_min == 0) { CloseHandle(fh); return -1; }
 
-        HANDLE hToken;
-        TOKEN_PRIVILEGES tp;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
-            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-            CloseHandle(hToken);
-        }
+    SIZE_T alloc_size = ((file_size + large_min - 1) / large_min) * large_min;
 
-        void *buf = VirtualAlloc(NULL, alloc_size,
-                                 MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-                                 PAGE_READWRITE);
-        if (buf) {
-            if (read_file_full(fh, buf, m->mmap_size) == 0) {
-                CloseHandle(fh);
-                m->mmap_addr  = buf;
-                m->file_handle = NULL;
-                m->map_handle  = (void*)(intptr_t)-1;
-                fprintf(stderr, "Model loaded: %zu MB (%zu MB huge pages, 2MB)\n",
-                        m->mmap_size >> 20, alloc_size >> 20);
-                return 0;
-            }
-            VirtualFree(buf, 0, MEM_RELEASE);
-        }
+    HANDLE hToken;
+    TOKEN_PRIVILEGES tp;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+        CloseHandle(hToken);
     }
 
-    /* Fall back to normal 4KB pages */
-    void *buf = VirtualAlloc(NULL, m->mmap_size,
-                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *buf = VirtualAlloc(NULL, alloc_size,
+                             MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                             PAGE_READWRITE);
     if (!buf) { CloseHandle(fh); return -1; }
 
-    if (read_file_full(fh, buf, m->mmap_size) != 0) {
-        VirtualFree(buf, 0, MEM_RELEASE);
-        CloseHandle(fh);
-        return -1;
+    uint8_t *p = (uint8_t *)buf;
+    size_t remaining = file_size;
+    while (remaining > 0) {
+        DWORD chunk = (DWORD)(remaining > 0x7FFFFFFF ? 0x7FFFFFFF : remaining);
+        DWORD read;
+        if (!ReadFile(fh, p, chunk, &read, NULL) || read != chunk) {
+            VirtualFree(buf, 0, MEM_RELEASE);
+            CloseHandle(fh);
+            return -1;
+        }
+        p += read;
+        remaining -= read;
     }
     CloseHandle(fh);
 
     m->mmap_addr  = buf;
     m->file_handle = NULL;
     m->map_handle  = (void*)(intptr_t)-1;
-    fprintf(stderr, "Model loaded: %zu MB\n", m->mmap_size >> 20);
+    m->mmap_size   = file_size;
+    fprintf(stderr, "Model loaded: %zu MB (huge pages, 2MB)\n", file_size >> 20);
     return 0;
 }
 #endif
 
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
-    /* VirtualAlloc + ReadFile path (handles huge pages too) */
-    if (mmap_file_alloc(m, path) == 0) return 0;
+    /* Huge pages: best-effort, reduces TLB misses on large models */
+    if (mmap_file_huge(m, path) == 0) return 0;
 
-    /* Ultimate fallback: traditional file mapping */
+    /* Normal file mapping — demand-paged, no extra memory overhead */
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -266,7 +240,6 @@ static int mmap_file(model_t *m, const char *path) {
     m->mmap_addr  = addr;
     m->file_handle = fh;
     m->map_handle  = mh;
-    fprintf(stderr, "Model loaded: %zu MB (file mapping)\n", m->mmap_size >> 20);
     prefault_mmap(addr, m->mmap_size);
 #else
     int fd = open(path, O_RDONLY);
@@ -808,15 +781,28 @@ static float *model_forward_ex(model_t *m, int token, int pos, int max_layers) {
         matmul_bias(s->q, s->xb, lw->attn_q, s->attn_q_bias[l],
                     dim, q_dim, lw->type_attn_q, lw->type_attn_q_b, s->dequant_scratch);
 
-        /* K and V: project into float temp, then store as FP16 in cache */
-        float *k_tmp = s->xb2; /* reuse xb2 as temp for K */
-        matmul_bias(k_tmp, s->xb, lw->attn_k, s->attn_k_bias[l],
-                    dim, kv_dim, lw->type_attn_k, lw->type_attn_k_b, s->dequant_scratch);
+        /* K+V fused: load both weight matrices in one traversal */
+        float *k_tmp = s->xb2;
+        float *v_tmp = s->hb; /* kv_dim fits; n_ffn=18944 >> 512 */
+        matmul_dual(k_tmp, v_tmp, s->xb,
+                    lw->attn_k, lw->attn_v,
+                    dim, kv_dim, lw->type_attn_k, lw->type_attn_v);
 
-        /* Store K as FP16 */
+        /* K bias (if present, e.g. Qwen2) */
+        if (lw->attn_k_b) {
+            dequantize_row(lw->attn_k_b, s->dequant_scratch, kv_dim, lw->type_attn_k_b);
+            vec_add(k_tmp, s->dequant_scratch, kv_dim);
+        }
+        /* V bias (if present) */
+        if (lw->attn_v_b) {
+            dequantize_row(lw->attn_v_b, s->dequant_scratch, kv_dim, lw->type_attn_v_b);
+            vec_add(v_tmp, s->dequant_scratch, kv_dim);
+        }
+
         uint16_t *kcache_layer = s->key_cache + (size_t)l * seq_len * kv_dim;
         uint16_t *vcache_layer = s->val_cache + (size_t)l * seq_len * kv_dim;
         uint16_t *key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
+        uint16_t *val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
 
         /* QK-norm (Qwen3): per-head RMSNorm applied before RoPE */
         if (lw->attn_q_norm) {
@@ -833,17 +819,9 @@ static float *model_forward_ex(model_t *m, int token, int pos, int max_layers) {
         /* Apply RoPE to Q and K (using pre-computed tables) */
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
 
-        /* Convert K to FP16 and store */
+        /* Store K and V to FP16 cache */
         for (int d = 0; d < kv_dim; d++) {
             key_pos_fp16[d] = fp32_to_fp16(k_tmp[d]);
-        }
-
-        /* V projection -> store directly as FP16 */
-        float *v_tmp = s->xb2;
-        matmul_bias(v_tmp, s->xb, lw->attn_v, s->attn_v_bias[l],
-                    dim, kv_dim, lw->type_attn_v, lw->type_attn_v_b, s->dequant_scratch);
-        uint16_t *val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
-        for (int d = 0; d < kv_dim; d++) {
             val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
         }
 
